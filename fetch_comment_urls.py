@@ -113,6 +113,18 @@ def _extract_with_bs4(html_content: str, base_url: str, user_id: int) -> List[Di
     comments = []
     seen_ids = set()
 
+    # Extract user name
+    user_name = ""
+    h1_tag = soup.find('h1')
+    if h1_tag:
+        user_name = h1_tag.get_text(strip=True)
+    if not user_name:
+        og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
+        if og_title and og_title.get('content'):
+            user_name = re.sub(r'^Comments by\s+', '', og_title.get('content', ''), flags=re.IGNORECASE).strip()
+    if not user_name and soup.title:
+        user_name = re.sub(r'^Comments by\s+', '', soup.title.get_text(strip=True), flags=re.IGNORECASE).strip()
+
     comment_divs = soup.find_all('div', class_=lambda c: c and 'comment' in c.split())
 
     for div in comment_divs:
@@ -122,35 +134,30 @@ def _extract_with_bs4(html_content: str, base_url: str, user_id: int) -> List[Di
             continue
 
         raw_href = link_tag.get('href', '').strip()
-        if not raw_href or ('comment' not in raw_href and '#' not in raw_href and '/comments' not in raw_href and not raw_href.startswith('/')):
+        if not raw_href or 'comment=' not in raw_href:
+            continue
+
+        # Ignore subcomments / reply comments containing '#' (e.g. ?comment=123#456)
+        if '#' in raw_href:
             continue
 
         full_url = urljoin(base_url, raw_href)
 
-        # 1. Extract comment ID from div id="commentText-<id>"
+        # Extract comment ID
         comment_id = None
+        match_param = re.search(r'comment=(\d+)', raw_href)
+        if match_param:
+            comment_id = int(match_param.group(1))
+
+        # Extract exact comment text
+        comment_text = ""
         text_div = body.find('div', id=lambda x: x and x.startswith('commentText-'))
         if text_div:
-            id_match = re.search(r'commentText-(\d+)', text_div.get('id', ''))
-            if id_match:
-                comment_id = int(id_match.group(1))
-
-        # 2. Fallback: from URL anchor (#<id>) or param (?comment=<id>)
-        if not comment_id:
-            match_hash = re.search(r'#(\d+)', raw_href)
-            if match_hash:
-                comment_id = int(match_hash.group(1))
-            else:
-                match_param = re.search(r'comment=(\d+)', raw_href)
-                if match_param:
-                    comment_id = int(match_param.group(1))
-
-        # 3. Fallback: from data-comment-id
-        if not comment_id and div.get('data-comment-id'):
-            try:
-                comment_id = int(div.get('data-comment-id'))
-            except ValueError:
-                pass
+            comment_text = text_div.get_text(separator=' ', strip=True)
+            if not comment_id:
+                id_match = re.search(r'commentText-(\d+)', text_div.get('id', ''))
+                if id_match:
+                    comment_id = int(id_match.group(1))
 
         if not comment_id or comment_id in seen_ids:
             continue
@@ -159,7 +166,9 @@ def _extract_with_bs4(html_content: str, base_url: str, user_id: int) -> List[Di
         comments.append({
             'id': comment_id,
             'url': full_url,
-            'user_id': user_id
+            'user_id': user_id,
+            'user_name': user_name,
+            'comment_text': comment_text
         })
 
     return comments
@@ -169,6 +178,16 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int) -> List[
     comments = []
     seen_ids = set()
 
+    # Extract user name
+    user_name = ""
+    h1_match = re.search(r'<h1>(.*?)</h1>', html_content, re.IGNORECASE)
+    if h1_match:
+        user_name = re.sub(r'<[^>]+>', '', h1_match.group(1)).strip()
+    if not user_name:
+        title_match = re.search(r'<title>(.*?)</title>', html_content, re.IGNORECASE)
+        if title_match:
+            user_name = re.sub(r'^Comments by\s+', '', title_match.group(1), flags=re.IGNORECASE).strip()
+
     pattern = re.compile(
         r'<div[^>]*class=["\'][^"\']*comment userComment[^"\']*["\'][^>]*>(.*?)</div>\s*</div>\s*</div>',
         re.DOTALL | re.IGNORECASE
@@ -177,18 +196,24 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int) -> List[
     blocks = pattern.findall(html_content)
     if not blocks:
         link_text_pattern = re.compile(
-            r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>.*?</a>.*?<div[^>]*id=["\']commentText-(\d+)["\']',
+            r'<a[^>]*href=["\']([^"\']+)["\'][^>]*>.*?</a>.*?<div[^>]*id=["\']commentText-(\d+)["\'][^>]*>(.*?)</div>',
             re.DOTALL | re.IGNORECASE
         )
-        for href, c_id in link_text_pattern.findall(html_content):
+        for href, c_id, txt in link_text_pattern.findall(html_content):
+            raw_href = href.strip()
+            if '#' in raw_href or 'comment=' not in raw_href:
+                continue
+
             comment_id = int(c_id)
             if comment_id in seen_ids:
                 continue
             seen_ids.add(comment_id)
             comments.append({
                 'id': comment_id,
-                'url': urljoin(base_url, href.strip()),
-                'user_id': user_id
+                'url': urljoin(base_url, raw_href),
+                'user_id': user_id,
+                'user_name': user_name,
+                'comment_text': re.sub(r'<[^>]+>', '', txt).strip()
             })
         return comments
 
@@ -197,26 +222,36 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int) -> List[
         if not href_match:
             continue
         raw_href = href_match.group(1).strip()
+
+        if '#' in raw_href or 'comment=' not in raw_href:
+            continue
+
         full_url = urljoin(base_url, raw_href)
 
-        id_match = re.search(r'id=["\']commentText-(\d+)["\']', block)
-        if id_match:
-            comment_id = int(id_match.group(1))
+        param_match = re.search(r'comment=(\d+)', raw_href)
+        if param_match:
+            comment_id = int(param_match.group(1))
         else:
-            hash_match = re.search(r'#(\d+)', raw_href) or re.search(r'comment=(\d+)', raw_href)
-            if hash_match:
-                comment_id = int(hash_match.group(1))
+            id_match = re.search(r'id=["\']commentText-(\d+)["\']', block)
+            if id_match:
+                comment_id = int(id_match.group(1))
             else:
                 continue
 
         if comment_id in seen_ids:
             continue
 
+        # Extract text from commentText div
+        text_match = re.search(r'<div[^>]*id=["\']commentText-\d+["\'][^>]*>(.*?)</div>', block, re.DOTALL)
+        comment_text = re.sub(r'<[^>]+>', '', text_match.group(1)).strip() if text_match else ""
+
         seen_ids.add(comment_id)
         comments.append({
             'id': comment_id,
             'url': full_url,
-            'user_id': user_id
+            'user_id': user_id,
+            'user_name': user_name,
+            'comment_text': comment_text
         })
 
     return comments
@@ -229,6 +264,7 @@ class DatabaseManager:
     def __init__(self, config: Dict[str, Any] = DB_CONFIG):
         self.config = config
         self.conn = None
+        self._ensured_columns = False
 
     def _get_best_driver(self) -> str:
         if not HAS_PYODBC:
@@ -269,6 +305,7 @@ class DatabaseManager:
             conn_str = self._build_pyodbc_conn_str()
             logger.info("Connecting to SQL Server via pyodbc...")
             self.conn = pyodbc.connect(conn_str, autocommit=False)
+            self._ensure_schema_columns()
             return self.conn
         elif HAS_PYMSSQL:
             logger.info("Connecting to SQL Server via pymssql...")
@@ -279,9 +316,42 @@ class DatabaseManager:
                 database=self.config.get('database', 'InvestingDB'),
                 autocommit=False
             )
+            self._ensure_schema_columns()
             return self.conn
         else:
             raise RuntimeError("Neither 'pyodbc' nor 'pymssql' is installed. Please run: pip install pyodbc")
+
+    def _ensure_schema_columns(self):
+        """Ensures the Comments and user_name columns exist in dbo.comment_urls table."""
+        if self._ensured_columns or not self.conn:
+            return
+        try:
+            cursor = self.conn.cursor()
+            # Ensure Comments column
+            cursor.execute("""
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID('dbo.comment_urls') AND name = 'Comments'
+            )
+            BEGIN
+                ALTER TABLE dbo.comment_urls ADD Comments NVARCHAR(MAX);
+            END
+            """)
+            # Ensure user_name column
+            cursor.execute("""
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID('dbo.comment_urls') AND name = 'user_name'
+            )
+            BEGIN
+                ALTER TABLE dbo.comment_urls ADD user_name NVARCHAR(MAX);
+            END
+            """)
+            self.conn.commit()
+            cursor.close()
+            self._ensured_columns = True
+        except Exception as e:
+            logger.debug(f"Note on column schema checks: {e}")
 
     def _build_pyodbc_conn_str(self) -> str:
         driver = self._get_best_driver()
@@ -343,56 +413,46 @@ class DatabaseManager:
         except Exception:
             pass
 
-        insert_with_id_sql = """
-        SET IDENTITY_INSERT dbo.comment_urls ON;
-        IF NOT EXISTS (SELECT 1 FROM dbo.comment_urls WHERE id = ? OR (user_id = ? AND url = ?))
-        BEGIN
-            INSERT INTO dbo.comment_urls (id, url, user_id, status, fetched_at)
-            VALUES (?, ?, ?, N'not processed', SYSDATETIME());
-        END
-        SET IDENTITY_INSERT dbo.comment_urls OFF;
-        """
-
         insert_without_id_sql = """
         IF NOT EXISTS (SELECT 1 FROM dbo.comment_urls WHERE (user_id = ? AND url = ?))
         BEGIN
-            INSERT INTO dbo.comment_urls (url, user_id, status, fetched_at)
-            VALUES (?, ?, N'not processed', SYSDATETIME());
+            INSERT INTO dbo.comment_urls (url, user_id, status, fetched_at, Comments, user_name)
+            VALUES (?, ?, N'not processed', SYSDATETIME(), ?, ?);
         END
         """
 
         insert_plain_sql = """
         IF NOT EXISTS (SELECT 1 FROM dbo.comment_urls WHERE id = ? OR (user_id = ? AND url = ?))
         BEGIN
-            INSERT INTO dbo.comment_urls (id, url, user_id, status, fetched_at)
-            VALUES (?, ?, ?, N'not processed', SYSDATETIME());
+            INSERT INTO dbo.comment_urls (id, url, user_id, status, fetched_at, Comments, user_name)
+            VALUES (?, ?, ?, N'not processed', SYSDATETIME(), ?, ?);
         END
         """
 
         for c in comments:
+            comment_text = c.get('comment_text', '')
+            user_name = c.get('user_name', '')
             try:
                 if is_identity:
-                    # Table uses auto-increment identity
                     cursor.execute(insert_without_id_sql, (
                         c['user_id'], c['url'],
-                        c['url'], c['user_id']
+                        c['url'], c['user_id'], comment_text, user_name
                     ))
                 else:
                     cursor.execute(insert_plain_sql, (
                         c['id'], c['user_id'], c['url'],
-                        c['id'], c['url'], c['user_id']
+                        c['id'], c['url'], c['user_id'], comment_text, user_name
                     ))
 
                 if cursor.rowcount > 0:
                     inserted_count += 1
             except Exception as e:
                 err_str = str(e)
-                # If error 544 (IDENTITY_INSERT), fallback to inserting without explicit ID
                 if '544' in err_str:
                     try:
                         cursor.execute(insert_without_id_sql, (
                             c['user_id'], c['url'],
-                            c['url'], c['user_id']
+                            c['url'], c['user_id'], comment_text, user_name
                         ))
                         if cursor.rowcount > 0:
                             inserted_count += 1
@@ -536,9 +596,11 @@ def process_user(
             return
 
         if dry_run:
-            logger.info(f"[DRY-RUN] Found {len(comments)} comments for User {user_id}:")
+            name_str = comments[0].get('user_name', '') if comments else ''
+            logger.info(f"[DRY-RUN] Found {len(comments)} primary comments for User {user_id} (User Name: '{name_str}'):")
             for idx, c in enumerate(comments, 1):
-                logger.info(f"  {idx}. ID: {c['id']} | URL: {c['url']}")
+                preview = (c.get('comment_text', '')[:70] + '...') if len(c.get('comment_text', '')) > 70 else c.get('comment_text', '')
+                logger.info(f"  {idx}. ID: {c['id']} | User: {c.get('user_name')} | URL: {c['url']} | Text: \"{preview}\"")
             return
 
         if comments:

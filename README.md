@@ -23,6 +23,8 @@ CREATE TABLE InvestingDB.dbo.comment_urls (
 	fetched_at datetime2 DEFAULT sysdatetime() NOT NULL,
 	user_id bigint DEFAULT 0 NOT NULL,
 	status nvarchar(50) COLLATE SQL_Latin1_General_CP1_CI_AS DEFAULT N'not processed' NOT NULL,
+	Comments nvarchar(max) NULL,
+	user_name nvarchar(max) NULL,
 	CONSTRAINT comment_urls_pkey PRIMARY KEY (id),
 	CONSTRAINT comment_urls_user_id_url_key UNIQUE (user_id,url)
 );
