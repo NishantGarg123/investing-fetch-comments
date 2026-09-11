@@ -49,7 +49,7 @@ CREATE NONCLUSTERED INDEX idx_comment_urls_user_id ON InvestingDB.dbo.comment_ur
 
 ## 🚀 Usage
 
-### 1. Run standard batch scraper (processes all `status = 'not processed'` users):
+### 1. Run standard batch scraper (processes users from database status-independently):
 ```bash
 python fetch_comment_urls.py
 ```
@@ -73,7 +73,10 @@ python fetch_comment_urls.py --pages 2 --limit 50
 
 ## ⚙️ Features
 - **Accurate Comment ID & URL Parsing**: Extracts unique comment IDs (`commentText-<id>` / `#<id>` / `comment=<id>`) and full URLs.
-- **Idempotent DB Inserts**: Skips duplicates automatically using `IF NOT EXISTS` against primary key and unique constraints.
-- **User Status Lifecycle**: Automatically updates user status in `users` table to `'processed'`, `'no_comments'`, or `'failed'`.
+- **Status-Independent User Queue**: Reads users from the database without filtering by user status.
+- **User Name from DB**: Resolves user name directly from the `users` table and saves it into `comment_urls`.
+- **Default Comment URL Status**: Every saved comment URL is assigned `status = 'not processed'`.
+- **Idempotent DB Inserts & Updates**: Skips duplicates automatically or updates user name/comments without duplicating records.
+- **User Status Lifecycle**: Updates user status in `users` table to `'processed'`, `'no_comments'`, or `'failed'`.
 - **Browser Emulation**: Uses realistic browser headers and retry strategy to prevent blocking.
 - **Polite Delay**: Includes configurable randomized delays between requests.

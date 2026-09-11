@@ -98,32 +98,25 @@ logger = logging.getLogger("InvestingScraper")
 # HTML PARSER LOGIC
 # ==========================================
 
-def extract_comments_from_html(html_content: str, base_url: str = BASE_URL, user_id: int = 0) -> List[Dict[str, Any]]:
+def extract_comments_from_html(
+    html_content: str,
+    base_url: str = BASE_URL,
+    user_id: int = 0,
+    user_name: str = ""
+) -> List[Dict[str, Any]]:
     if not html_content:
         return []
 
     if HAS_BS4:
-        return _extract_with_bs4(html_content, base_url, user_id)
+        return _extract_with_bs4(html_content, base_url, user_id, user_name)
     else:
-        return _extract_with_regex(html_content, base_url, user_id)
+        return _extract_with_regex(html_content, base_url, user_id, user_name)
 
 
-def _extract_with_bs4(html_content: str, base_url: str, user_id: int) -> List[Dict[str, Any]]:
+def _extract_with_bs4(html_content: str, base_url: str, user_id: int, user_name: str = "") -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html_content, 'html.parser')
     comments = []
     seen_ids = set()
-
-    # Extract user name
-    user_name = ""
-    h1_tag = soup.find('h1')
-    if h1_tag:
-        user_name = h1_tag.get_text(strip=True)
-    if not user_name:
-        og_title = soup.find('meta', property='og:title') or soup.find('meta', attrs={'name': 'twitter:title'})
-        if og_title and og_title.get('content'):
-            user_name = re.sub(r'^Comments by\s+', '', og_title.get('content', ''), flags=re.IGNORECASE).strip()
-    if not user_name and soup.title:
-        user_name = re.sub(r'^Comments by\s+', '', soup.title.get_text(strip=True), flags=re.IGNORECASE).strip()
 
     comment_divs = soup.find_all('div', class_=lambda c: c and 'comment' in c.split())
 
@@ -174,19 +167,9 @@ def _extract_with_bs4(html_content: str, base_url: str, user_id: int) -> List[Di
     return comments
 
 
-def _extract_with_regex(html_content: str, base_url: str, user_id: int) -> List[Dict[str, Any]]:
+def _extract_with_regex(html_content: str, base_url: str, user_id: int, user_name: str = "") -> List[Dict[str, Any]]:
     comments = []
     seen_ids = set()
-
-    # Extract user name
-    user_name = ""
-    h1_match = re.search(r'<h1>(.*?)</h1>', html_content, re.IGNORECASE)
-    if h1_match:
-        user_name = re.sub(r'<[^>]+>', '', h1_match.group(1)).strip()
-    if not user_name:
-        title_match = re.search(r'<title>(.*?)</title>', html_content, re.IGNORECASE)
-        if title_match:
-            user_name = re.sub(r'^Comments by\s+', '', title_match.group(1), flags=re.IGNORECASE).strip()
 
     pattern = re.compile(
         r'<div[^>]*class=["\'][^"\']*comment userComment[^"\']*["\'][^>]*>(.*?)</div>\s*</div>\s*</div>',
@@ -265,6 +248,7 @@ class DatabaseManager:
         self.config = config
         self.conn = None
         self._ensured_columns = False
+        self._user_name_col_cached = None
 
     def _get_best_driver(self) -> str:
         if not HAS_PYODBC:
@@ -327,7 +311,7 @@ class DatabaseManager:
             return
         try:
             cursor = self.conn.cursor()
-            # Ensure Comments column
+            # Ensure Comments column in comment_urls
             cursor.execute("""
             IF NOT EXISTS (
                 SELECT 1 FROM sys.columns 
@@ -337,7 +321,7 @@ class DatabaseManager:
                 ALTER TABLE dbo.comment_urls ADD Comments NVARCHAR(MAX);
             END
             """)
-            # Ensure user_name column
+            # Ensure user_name column in comment_urls
             cursor.execute("""
             IF NOT EXISTS (
                 SELECT 1 FROM sys.columns 
@@ -352,6 +336,46 @@ class DatabaseManager:
             self._ensured_columns = True
         except Exception as e:
             logger.debug(f"Note on column schema checks: {e}")
+
+    def _get_user_name_column(self) -> Optional[str]:
+        """Dynamically identifies the column name for user name in dbo.users table."""
+        if self._user_name_col_cached is not None:
+            return self._user_name_col_cached
+
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COLUMN_NAME 
+                FROM INFORMATION_SCHEMA.COLUMNS 
+                WHERE TABLE_NAME = 'users'
+            """)
+            cols = [row[0].lower() for row in cursor.fetchall()]
+            cursor.close()
+            for candidate in ['user_name', 'username', 'name', 'profile_name', 'profilename', 'display_name', 'user']:
+                if candidate in cols:
+                    self._user_name_col_cached = candidate
+                    return self._user_name_col_cached
+        except Exception as e:
+            logger.debug(f"Could not determine user name column in users table: {e}")
+
+        self._user_name_col_cached = None
+        return None
+
+    def get_user_name(self, user_id: int) -> str:
+        """Fetches the user name for a given user ID from InvestingDB.dbo.users table."""
+        name_col = self._get_user_name_column() or 'user_name'
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT {name_col} FROM InvestingDB.dbo.users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+            cursor.close()
+            if row and row[0] is not None:
+                return str(row[0]).strip()
+        except Exception as e:
+            logger.debug(f"Could not fetch user name from users table for user_id={user_id}: {e}")
+        return ""
 
     def _build_pyodbc_conn_str(self) -> str:
         driver = self._get_best_driver()
@@ -381,19 +405,32 @@ class DatabaseManager:
 
         return ";".join(parts) + ";"
 
-    def get_unprocessed_users(self, limit: Optional[int] = None) -> List[int]:
+    def get_users(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Fetches users from InvestingDB.dbo.users table status-independently (without filtering by status).
+        Returns a list of dicts: [{'id': <int>, 'user_name': <str>}, ...]
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        query = "SELECT id FROM InvestingDB.dbo.users WHERE status IN ('unprocessed', 'not processed', 'pending', 'new')"
-        if limit:
-            query = f"SELECT TOP {int(limit)} id FROM InvestingDB.dbo.users WHERE status IN ('unprocessed', 'not processed', 'pending', 'new')"
+        name_col = self._get_user_name_column()
+        select_cols = f"id, {name_col}" if name_col else "id"
+        top_clause = f"TOP {int(limit)} " if limit else ""
+        query = f"SELECT {top_clause}{select_cols} FROM InvestingDB.dbo.users"
             
         cursor.execute(query)
         rows = cursor.fetchall()
-        user_ids = [int(row[0]) for row in rows]
+        users = []
+        for row in rows:
+            u_id = int(row[0])
+            u_name = str(row[1]).strip() if (name_col and len(row) > 1 and row[1] is not None) else ""
+            users.append({'id': u_id, 'user_name': u_name})
         cursor.close()
-        return user_ids
+        return users
+
+    def get_unprocessed_users(self, limit: Optional[int] = None) -> List[int]:
+        """Backward compatibility helper that returns list of user IDs."""
+        return [u['id'] for u in self.get_users(limit=limit)]
 
     def insert_comment_urls(self, comments: List[Dict[str, Any]]) -> int:
         if not comments:
@@ -467,16 +504,6 @@ class DatabaseManager:
         cursor.close()
         return inserted_count
 
-    def update_user_status(self, user_id: int, status: str) -> None:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        try:
-            update_sql = "UPDATE InvestingDB.dbo.users SET status = ? WHERE id = ?"
-            cursor.execute(update_sql, (status, user_id))
-            conn.commit()
-        finally:
-            cursor.close()
-
     def close(self):
         if self.conn:
             try:
@@ -515,7 +542,8 @@ def create_scraper_session():
 def fetch_user_comments(
     session,
     user_id: int,
-    max_pages: int = MAX_PAGES_PER_USER
+    max_pages: int = MAX_PAGES_PER_USER,
+    user_name: str = ""
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Fetches comments for a user across pages.
@@ -548,7 +576,12 @@ def fetch_user_comments(
                 success = False
                 break
 
-            page_comments = extract_comments_from_html(response.text, base_url=BASE_URL, user_id=user_id)
+            page_comments = extract_comments_from_html(
+                response.text,
+                base_url=BASE_URL,
+                user_id=user_id,
+                user_name=user_name
+            )
 
             if not page_comments:
                 logger.info(f"No comments found on page {page} for user {user_id}.")
@@ -583,21 +616,24 @@ def process_user(
     session,
     user_id: int,
     max_pages: int,
+    user_name: str = "",
     dry_run: bool = False
 ) -> None:
-    logger.info(f"--- Starting processing for User ID: {user_id} ---")
+    # If user_name not supplied, fetch it directly from dbo.users table
+    if not user_name:
+        user_name = db.get_user_name(user_id)
+
+    name_display = f" (Name: '{user_name}')" if user_name else ""
+    logger.info(f"--- Starting processing for User ID: {user_id}{name_display} ---")
     try:
-        comments, success = fetch_user_comments(session, user_id, max_pages=max_pages)
+        comments, success = fetch_user_comments(session, user_id, max_pages=max_pages, user_name=user_name)
 
         if not success:
-            logger.warning(f"Request failed for User {user_id}. Updating status to 'failed'")
-            if not dry_run:
-                db.update_user_status(user_id, 'failed')
+            logger.warning(f"Request failed for User {user_id}.")
             return
 
         if dry_run:
-            name_str = comments[0].get('user_name', '') if comments else ''
-            logger.info(f"[DRY-RUN] Found {len(comments)} primary comments for User {user_id} (User Name: '{name_str}'):")
+            logger.info(f"[DRY-RUN] Found {len(comments)} primary comments for User {user_id} (User Name: '{user_name}'):")
             for idx, c in enumerate(comments, 1):
                 preview = (c.get('comment_text', '')[:70] + '...') if len(c.get('comment_text', '')) > 70 else c.get('comment_text', '')
                 logger.info(f"  {idx}. ID: {c['id']} | User: {c.get('user_name')} | URL: {c['url']} | Text: \"{preview}\"")
@@ -605,28 +641,20 @@ def process_user(
 
         if comments:
             inserted_count = db.insert_comment_urls(comments)
-            logger.info(f"Saved {inserted_count} new comment URLs to database (out of {len(comments)} found) for User {user_id}")
-            db.update_user_status(user_id, 'processed')
+            logger.info(f"Saved {inserted_count} comment URLs to database (out of {len(comments)} found) for User {user_id}")
         else:
-            logger.info(f"No comments found for User {user_id}. Updating status to 'no_comments'")
-            db.update_user_status(user_id, 'no_comments')
+            logger.info(f"No comments found for User {user_id}.")
 
     except Exception as e:
         logger.exception(f"Unexpected error processing User {user_id}: {e}")
-        if not dry_run:
-            try:
-                db.update_user_status(user_id, 'failed')
-            except Exception:
-                pass
 
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape comment URLs from Investing.com users and store into SQL database.")
     parser.add_argument("--user-id", type=int, help="Single user ID to scrape directly.")
     parser.add_argument("--pages", type=int, default=MAX_PAGES_PER_USER, help=f"Max pages to scrape per user (default: {MAX_PAGES_PER_USER}).")
-    parser.add_argument("--limit", type=int, help="Limit number of unprocessed users to fetch from database.")
+    parser.add_argument("--limit", type=int, help="Limit number of users to fetch from database.")
     parser.add_argument("--dry-run", action="store_true", help="Scrape and display comment URLs without writing to database.")
-    parser.add_argument("--retry-failed", action="store_true", help="Also retry users marked as 'failed' or 'no_comments'.")
     args = parser.parse_args()
 
     session = create_scraper_session()
@@ -639,20 +667,22 @@ def main():
             if args.dry_run:
                 logger.info("Running in DRY-RUN mode. Database updates are disabled.")
 
-            logger.info("Connecting to database to fetch unprocessed users...")
-            unprocessed_users = db.get_unprocessed_users(limit=args.limit)
+            logger.info("Connecting to database to fetch users (status-independent)...")
+            users = db.get_users(limit=args.limit)
 
-            if not unprocessed_users:
-                logger.info("No unprocessed users found in InvestingDB.dbo.users table.")
+            if not users:
+                logger.info("No users found in InvestingDB.dbo.users table.")
                 return
 
-            logger.info(f"Found {len(unprocessed_users)} unprocessed user(s) to scrape.")
+            logger.info(f"Found {len(users)} user(s) in database to scrape.")
 
-            for i, user_id in enumerate(unprocessed_users, 1):
-                logger.info(f"Progress: [{i}/{len(unprocessed_users)}]")
-                process_user(db, session, user_id, max_pages=args.pages, dry_run=args.dry_run)
+            for i, user_info in enumerate(users, 1):
+                u_id = user_info['id']
+                u_name = user_info.get('user_name', '')
+                logger.info(f"Progress: [{i}/{len(users)}] (User ID: {u_id}, Name: '{u_name}')")
+                process_user(db, session, user_id=u_id, max_pages=args.pages, user_name=u_name, dry_run=args.dry_run)
 
-                if i < len(unprocessed_users):
+                if i < len(users):
                     delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
                     time.sleep(delay)
 
