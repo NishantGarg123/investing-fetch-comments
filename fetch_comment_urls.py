@@ -5,7 +5,7 @@ import random
 import logging
 import argparse
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from urllib.parse import urljoin
 
 # Try curl_cffi for bypassing Cloudflare / Akamai TLS fingerprint checks
@@ -59,7 +59,7 @@ DB_CONFIG = {
 }
 
 BASE_URL = "https://www.investing.com"
-MAX_PAGES_PER_USER = int(os.getenv('MAX_PAGES_PER_USER', '2'))
+MAX_PAGES_PER_USER = int(os.getenv('MAX_PAGES_PER_USER', '1'))
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '20'))
 REQUEST_DELAY_MIN = float(os.getenv('REQUEST_DELAY_MIN', '1.5'))
 REQUEST_DELAY_MAX = float(os.getenv('REQUEST_DELAY_MAX', '3.0'))
@@ -377,6 +377,29 @@ class DatabaseManager:
             logger.debug(f"Could not fetch user name from users table for user_id={user_id}: {e}")
         return ""
 
+    def get_user_by_name(self, user_name: str) -> Optional[Dict[str, Any]]:
+        """Fetches user (id and name) for a given user name from InvestingDB.dbo.users table."""
+        if not user_name or not str(user_name).strip():
+            return None
+        cleaned_name = str(user_name).strip()
+        name_col = self._get_user_name_column() or 'user_name'
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT id, {name_col} FROM InvestingDB.dbo.users WHERE LOWER(LTRIM(RTRIM({name_col}))) = LOWER(?)",
+                (cleaned_name,)
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            if row and row[0] is not None:
+                u_id = int(row[0])
+                u_name = str(row[1]).strip() if (len(row) > 1 and row[1] is not None) else cleaned_name
+                return {'id': u_id, 'user_name': u_name}
+        except Exception as e:
+            logger.debug(f"Could not fetch user by name '{cleaned_name}' from users table: {e}")
+        return None
+
     def _build_pyodbc_conn_str(self) -> str:
         driver = self._get_best_driver()
         server = self.config.get('server', 'localhost')
@@ -657,7 +680,9 @@ def process_user(
 
 
 def run_scraper(
-    user_id: Optional[int] = None,
+    user_id: Optional[Union[int, str]] = None,
+    user_name: Optional[str] = None,
+    users: Optional[List[Dict[str, Any]]] = None,
     pages: Optional[int] = None,
     limit: Optional[int] = None,
     dry_run: bool = False,
@@ -665,6 +690,12 @@ def run_scraper(
 ) -> Dict[str, Any]:
     """
     Executes the scraper programmatically and returns a summary dictionary.
+
+    If 'users' or 'user_id' is provided:
+        - Runs the scraper ONLY for the specified user(s) provided in the request body/args.
+        - Does NOT query or take user IDs from the database 'users' table.
+    If no user(s) provided:
+        - Fetches user list from InvestingDB.dbo.users table and runs for all users in the DB.
     """
     max_pages = pages if (pages is not None and pages > 0) else MAX_PAGES_PER_USER
     session = create_scraper_session()
@@ -686,38 +717,86 @@ def run_scraper(
     }
 
     try:
-        if user_id:
-            summary["users_total"] = 1
-            if progress_callback:
-                progress_callback(1, 1, user_id, "")
-            res = process_user(db, session, user_id, max_pages=max_pages, dry_run=dry_run)
-            summary["users_processed"] = 1
-            summary["comments_found"] += res.get("found", 0)
-            summary["comments_saved"] += res.get("saved", 0)
-            if res.get("error"):
-                summary["errors"].append({"user_id": user_id, "error": res["error"]})
-        else:
+        # 1. Determine if a specific user / users were targeted in request
+        user_was_specified = bool(
+            users or
+            (user_id is not None and str(user_id).strip()) or
+            (user_name is not None and str(user_name).strip())
+        )
+        target_users = []
+
+        if users:
+            raw_list = users if isinstance(users, list) else [users]
+            for u in raw_list:
+                if isinstance(u, dict):
+                    raw_id = u.get('id') if u.get('id') is not None else (u.get('user_id') if u.get('user_id') is not None else u.get('userId'))
+                    uname = str(u.get('user_name') or u.get('username') or u.get('name') or u.get('user') or '').strip()
+                    if raw_id is not None and str(raw_id).strip():
+                        try:
+                            uid = int(str(raw_id).strip())
+                            target_users.append({'id': uid, 'user_name': uname})
+                        except (ValueError, TypeError):
+                            logger.warning(f"Skipping invalid user ID in users list: {raw_id}")
+                    elif uname:
+                        db_user = db.get_user_by_name(uname)
+                        if db_user:
+                            target_users.append(db_user)
+                        else:
+                            err_msg = f"User '{uname}' not found in database to resolve numeric user_id."
+                            logger.warning(err_msg)
+                            summary["errors"].append({"user_name": uname, "error": err_msg})
+                elif isinstance(u, int) or (isinstance(u, str) and u.strip().isdigit()):
+                    target_users.append({'id': int(str(u).strip()), 'user_name': ''})
+                elif isinstance(u, str) and u.strip():
+                    uname = u.strip()
+                    db_user = db.get_user_by_name(uname)
+                    if db_user:
+                        target_users.append(db_user)
+                    else:
+                        err_msg = f"User '{uname}' not found in database to resolve numeric user_id."
+                        logger.warning(err_msg)
+                        summary["errors"].append({"user_name": uname, "error": err_msg})
+
+        elif (user_id is not None and str(user_id).strip()) or (user_name is not None and str(user_name).strip()):
+            uid = None
+            uname = str(user_name or '').strip()
+            if user_id is not None and str(user_id).strip():
+                try:
+                    uid = int(str(user_id).strip())
+                except (ValueError, TypeError):
+                    logger.warning(f"Invalid user_id provided: {user_id}")
+            
+            if uid is not None:
+                target_users.append({'id': uid, 'user_name': uname})
+            elif uname:
+                db_user = db.get_user_by_name(uname)
+                if db_user:
+                    target_users.append(db_user)
+                else:
+                    err_msg = f"User '{uname}' not found in database to resolve numeric user_id."
+                    logger.warning(err_msg)
+                    summary["errors"].append({"user_name": uname, "error": err_msg})
+
+        if user_was_specified:
+            if not target_users:
+                logger.warning("User(s) were specified in the request but could not be resolved. Will NOT run for database users.")
+                summary["status"] = "failed"
+                return summary
+
+            # RUN ONLY FOR SPECIFIED USERS IN BODY / ARGS (BYPASS USERS TABLE QUERY)
             if dry_run:
                 logger.info("Running in DRY-RUN mode. Database updates are disabled.")
 
-            logger.info("Connecting to database to fetch users (status-independent)...")
-            users = db.get_users(limit=limit)
+            summary["users_total"] = len(target_users)
+            logger.info(f"Targeting {len(target_users)} specified user(s) directly from request payload (skipping dbo.users query): {target_users}")
 
-            if not users:
-                logger.info("No users found in InvestingDB.dbo.users table.")
-                summary["status"] = "completed"
-                return summary
-
-            summary["users_total"] = len(users)
-            logger.info(f"Found {len(users)} user(s) in database to scrape.")
-
-            for i, user_info in enumerate(users, 1):
+            for i, user_info in enumerate(target_users, 1):
                 u_id = user_info['id']
                 u_name = user_info.get('user_name', '')
-                logger.info(f"Progress: [{i}/{len(users)}] (User ID: {u_id}, Name: '{u_name}')")
-                
+                logger.info(f"Progress: [{i}/{len(target_users)}] (User ID: {u_id}, Name: '{u_name}')")
+
                 if progress_callback:
-                    progress_callback(i, len(users), u_id, u_name)
+                    progress_callback(i, len(target_users), u_id, u_name)
 
                 res = process_user(db, session, user_id=u_id, max_pages=max_pages, user_name=u_name, dry_run=dry_run)
                 summary["users_processed"] += 1
@@ -726,7 +805,41 @@ def run_scraper(
                 if res.get("error"):
                     summary["errors"].append({"user_id": u_id, "error": res["error"]})
 
-                if i < len(users):
+                if i < len(target_users):
+                    delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
+                    time.sleep(delay)
+        else:
+            # NO USER SPECIFIED IN REQUEST -> FETCH USERS FROM DATABASE USERS TABLE
+            if dry_run:
+                logger.info("Running in DRY-RUN mode. Database updates are disabled.")
+
+            logger.info("No specific user in request. Connecting to database to fetch users from dbo.users...")
+            users_from_db = db.get_users(limit=limit)
+
+            if not users_from_db:
+                logger.info("No users found in InvestingDB.dbo.users table.")
+                summary["status"] = "completed"
+                return summary
+
+            summary["users_total"] = len(users_from_db)
+            logger.info(f"Found {len(users_from_db)} user(s) in database to scrape.")
+
+            for i, user_info in enumerate(users_from_db, 1):
+                u_id = user_info['id']
+                u_name = user_info.get('user_name', '')
+                logger.info(f"Progress: [{i}/{len(users_from_db)}] (User ID: {u_id}, Name: '{u_name}')")
+                
+                if progress_callback:
+                    progress_callback(i, len(users_from_db), u_id, u_name)
+
+                res = process_user(db, session, user_id=u_id, max_pages=max_pages, user_name=u_name, dry_run=dry_run)
+                summary["users_processed"] += 1
+                summary["comments_found"] += res.get("found", 0)
+                summary["comments_saved"] += res.get("saved", 0)
+                if res.get("error"):
+                    summary["errors"].append({"user_id": u_id, "error": res["error"]})
+
+                if i < len(users_from_db):
                     delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
                     time.sleep(delay)
 
@@ -750,7 +863,8 @@ def run_scraper(
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape comment URLs from Investing.com users and store into SQL database.")
-    parser.add_argument("--user-id", type=int, help="Single user ID to scrape directly.")
+    parser.add_argument("--user-id", type=str, help="Single user ID to scrape directly.")
+    parser.add_argument("--user-name", type=str, help="User name corresponding to --user-id.")
     parser.add_argument("--pages", type=int, default=MAX_PAGES_PER_USER, help=f"Max pages to scrape per user (default: {MAX_PAGES_PER_USER}).")
     parser.add_argument("--limit", type=int, help="Limit number of users to fetch from database.")
     parser.add_argument("--dry-run", action="store_true", help="Scrape and display comment URLs without writing to database.")
@@ -758,6 +872,7 @@ def main():
 
     run_scraper(
         user_id=args.user_id,
+        user_name=args.user_name,
         pages=args.pages,
         limit=args.limit,
         dry_run=args.dry_run

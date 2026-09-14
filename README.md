@@ -19,7 +19,7 @@ DB_TRUSTED_CONNECTION=no
 DB_ENCRYPT=no
 DB_TRUST_CERT=yes
 
-MAX_PAGES_PER_USER=2
+MAX_PAGES_PER_USER=1
 ```
 
 ### 2. Start the Container
@@ -76,16 +76,23 @@ curl -X POST http://localhost:3000/api/run \
 }
 ```
 
-#### 2. Trigger Scraper for a Specific User
+#### 2. Trigger Scraper for a Specific User (Custom User Payload)
+When user parameters are provided in the body, the scraper runs **only** for the specified user (bypassing `dbo.users` table querying):
 ```bash
 curl -X POST http://localhost:3000/api/run \
      -H "Content-Type: application/json" \
-     -d '{"user_id": 201161838, "pages": 2, "dry_run": false}'
+     -d '{
+       "user_name": "Cash Patel",
+       "user_id": "274394243",
+       "user": "Cash Patel",
+       "pages": 1,
+       "dry_run": false
+     }'
 ```
 
 #### 3. Trigger Scraper via GET Request (Browser / Webhook)
 ```bash
-curl "http://localhost:3000/api/run?user_id=201161838&pages=2"
+curl "http://localhost:3000/api/run?user_id=274394243&user_name=Cash%20Patel&pages=1"
 ```
 
 #### 4. Trigger Scraper in Dry-Run Mode
