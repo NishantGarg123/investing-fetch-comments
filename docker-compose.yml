@@ -1,0 +1,15 @@
+services:
+  investing-scraper-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: investing_comment_scraper
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./comment_scraper.log:/app/comment_scraper.log
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

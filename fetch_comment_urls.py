@@ -618,35 +618,134 @@ def process_user(
     max_pages: int,
     user_name: str = "",
     dry_run: bool = False
-) -> None:
+) -> Dict[str, Any]:
     # If user_name not supplied, fetch it directly from dbo.users table
     if not user_name:
         user_name = db.get_user_name(user_id)
 
     name_display = f" (Name: '{user_name}')" if user_name else ""
     logger.info(f"--- Starting processing for User ID: {user_id}{name_display} ---")
+    result = {"user_id": user_id, "user_name": user_name, "found": 0, "saved": 0, "success": False}
     try:
         comments, success = fetch_user_comments(session, user_id, max_pages=max_pages, user_name=user_name)
+        result["found"] = len(comments)
+        result["success"] = success
 
         if not success:
             logger.warning(f"Request failed for User {user_id}.")
-            return
+            return result
 
         if dry_run:
             logger.info(f"[DRY-RUN] Found {len(comments)} primary comments for User {user_id} (User Name: '{user_name}'):")
             for idx, c in enumerate(comments, 1):
                 preview = (c.get('comment_text', '')[:70] + '...') if len(c.get('comment_text', '')) > 70 else c.get('comment_text', '')
                 logger.info(f"  {idx}. ID: {c['id']} | User: {c.get('user_name')} | URL: {c['url']} | Text: \"{preview}\"")
-            return
+            return result
 
         if comments:
             inserted_count = db.insert_comment_urls(comments)
+            result["saved"] = inserted_count
             logger.info(f"Saved {inserted_count} comment URLs to database (out of {len(comments)} found) for User {user_id}")
         else:
             logger.info(f"No comments found for User {user_id}.")
 
     except Exception as e:
         logger.exception(f"Unexpected error processing User {user_id}: {e}")
+        result["error"] = str(e)
+
+    return result
+
+
+def run_scraper(
+    user_id: Optional[int] = None,
+    pages: Optional[int] = None,
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+    progress_callback: Optional[Any] = None
+) -> Dict[str, Any]:
+    """
+    Executes the scraper programmatically and returns a summary dictionary.
+    """
+    max_pages = pages if (pages is not None and pages > 0) else MAX_PAGES_PER_USER
+    session = create_scraper_session()
+    db = DatabaseManager()
+
+    start_time = time.time()
+    summary = {
+        "status": "running",
+        "dry_run": dry_run,
+        "max_pages": max_pages,
+        "users_total": 0,
+        "users_processed": 0,
+        "comments_found": 0,
+        "comments_saved": 0,
+        "errors": [],
+        "start_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time)),
+        "end_time": None,
+        "duration_seconds": 0
+    }
+
+    try:
+        if user_id:
+            summary["users_total"] = 1
+            if progress_callback:
+                progress_callback(1, 1, user_id, "")
+            res = process_user(db, session, user_id, max_pages=max_pages, dry_run=dry_run)
+            summary["users_processed"] = 1
+            summary["comments_found"] += res.get("found", 0)
+            summary["comments_saved"] += res.get("saved", 0)
+            if res.get("error"):
+                summary["errors"].append({"user_id": user_id, "error": res["error"]})
+        else:
+            if dry_run:
+                logger.info("Running in DRY-RUN mode. Database updates are disabled.")
+
+            logger.info("Connecting to database to fetch users (status-independent)...")
+            users = db.get_users(limit=limit)
+
+            if not users:
+                logger.info("No users found in InvestingDB.dbo.users table.")
+                summary["status"] = "completed"
+                return summary
+
+            summary["users_total"] = len(users)
+            logger.info(f"Found {len(users)} user(s) in database to scrape.")
+
+            for i, user_info in enumerate(users, 1):
+                u_id = user_info['id']
+                u_name = user_info.get('user_name', '')
+                logger.info(f"Progress: [{i}/{len(users)}] (User ID: {u_id}, Name: '{u_name}')")
+                
+                if progress_callback:
+                    progress_callback(i, len(users), u_id, u_name)
+
+                res = process_user(db, session, user_id=u_id, max_pages=max_pages, user_name=u_name, dry_run=dry_run)
+                summary["users_processed"] += 1
+                summary["comments_found"] += res.get("found", 0)
+                summary["comments_saved"] += res.get("saved", 0)
+                if res.get("error"):
+                    summary["errors"].append({"user_id": u_id, "error": res["error"]})
+
+                if i < len(users):
+                    delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
+                    time.sleep(delay)
+
+        summary["status"] = "completed"
+        logger.info("Scraping completed successfully.")
+
+    except Exception as e:
+        logger.exception(f"Fatal scraper error: {e}")
+        summary["status"] = "failed"
+        summary["errors"].append({"fatal": str(e)})
+    finally:
+        end_time = time.time()
+        summary["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_time))
+        summary["duration_seconds"] = round(end_time - start_time, 2)
+        db.close()
+        if hasattr(session, 'close'):
+            session.close()
+
+    return summary
 
 
 def main():
@@ -657,42 +756,14 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Scrape and display comment URLs without writing to database.")
     args = parser.parse_args()
 
-    session = create_scraper_session()
-    db = DatabaseManager()
-
-    try:
-        if args.user_id:
-            process_user(db, session, args.user_id, max_pages=args.pages, dry_run=args.dry_run)
-        else:
-            if args.dry_run:
-                logger.info("Running in DRY-RUN mode. Database updates are disabled.")
-
-            logger.info("Connecting to database to fetch users (status-independent)...")
-            users = db.get_users(limit=args.limit)
-
-            if not users:
-                logger.info("No users found in InvestingDB.dbo.users table.")
-                return
-
-            logger.info(f"Found {len(users)} user(s) in database to scrape.")
-
-            for i, user_info in enumerate(users, 1):
-                u_id = user_info['id']
-                u_name = user_info.get('user_name', '')
-                logger.info(f"Progress: [{i}/{len(users)}] (User ID: {u_id}, Name: '{u_name}')")
-                process_user(db, session, user_id=u_id, max_pages=args.pages, user_name=u_name, dry_run=args.dry_run)
-
-                if i < len(users):
-                    delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-                    time.sleep(delay)
-
-            logger.info("Scraping completed successfully.")
-
-    finally:
-        db.close()
-        if hasattr(session, 'close'):
-            session.close()
+    run_scraper(
+        user_id=args.user_id,
+        pages=args.pages,
+        limit=args.limit,
+        dry_run=args.dry_run
+    )
 
 
 if __name__ == "__main__":
     main()
+
