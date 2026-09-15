@@ -61,6 +61,9 @@ class RunRequest(BaseModel):
     pages: Optional[int] = Field(None, ge=1, le=100, description=f"Number of pages to scrape per user (default: {MAX_PAGES_PER_USER})")
     limit: Optional[int] = Field(None, ge=1, description="Maximum number of users to fetch from DB")
     dry_run: bool = Field(False, description="Run in dry-run mode without writing to database")
+    proxy: Optional[Union[str, List[str]]] = Field(None, description="Proxy or list of proxies (e.g. username:password.218.218.252:5432)")
+    proxies: Optional[Union[List[str], str]] = Field(None, description="Alias for proxy")
+    proxy_file: Optional[str] = Field(None, description="Path to file containing list of proxies")
     background: bool = Field(True, description="Run asynchronously in background (returns immediately)")
 
     model_config = {
@@ -71,6 +74,7 @@ class RunRequest(BaseModel):
                 "user_name": "Cash Patel",
                 "pages": 1,
                 "dry_run": False,
+                "proxy": "username:password.218.218.252:5432",
                 "background": True
             }
         }
@@ -88,7 +92,9 @@ def _execute_scraper_job(
     users: Optional[List[Dict[str, Any]]],
     pages: Optional[int],
     limit: Optional[int],
-    dry_run: bool
+    dry_run: bool,
+    proxy: Optional[Union[str, List[str]]] = None,
+    proxy_file: Optional[str] = None
 ):
     def progress_update(current_idx: int, total: int, u_id: int, u_name: str):
         with _state_lock:
@@ -109,6 +115,8 @@ def _execute_scraper_job(
             pages=pages,
             limit=limit,
             dry_run=dry_run,
+            proxy=proxy,
+            proxy_file=proxy_file,
             progress_callback=progress_update
         )
     except Exception as e:
@@ -129,7 +137,9 @@ def _execute_scraper_job(
                 "users": users,
                 "pages": pages,
                 "limit": limit,
-                "dry_run": dry_run
+                "dry_run": dry_run,
+                "proxy": proxy,
+                "proxy_file": proxy_file
             },
             **summary
         }
@@ -227,6 +237,9 @@ def trigger_scraper_post(request: Optional[RunRequest] = Body(None)):
         elif isinstance(raw_users, (dict, int, str)):
             users_val = [raw_users]
 
+    raw_proxy = req_dict.get('proxy') if req_dict.get('proxy') is not None else req_dict.get('proxies')
+    raw_proxy_file = req_dict.get('proxy_file') or req_dict.get('proxyFile') or req_dict.get('proxies_file')
+
     return _start_scraper_job(
         user_id=user_id_val,
         user_name=user_name_val,
@@ -234,6 +247,8 @@ def trigger_scraper_post(request: Optional[RunRequest] = Body(None)):
         pages=request.pages,
         limit=request.limit,
         dry_run=request.dry_run,
+        proxy=raw_proxy,
+        proxy_file=raw_proxy_file,
         background=request.background
     )
 
@@ -250,6 +265,8 @@ def trigger_scraper_get(
     pages: Optional[int] = Query(None, ge=1, le=100, description="Max pages per user"),
     limit: Optional[int] = Query(None, ge=1, description="Max users to fetch from DB"),
     dry_run: bool = Query(False, description="Run in dry-run mode"),
+    proxy: Optional[str] = Query(None, description="Proxy or comma-separated list of proxies (e.g. username:password.218.218.252:5432)"),
+    proxy_file: Optional[str] = Query(None, description="Path to file containing list of proxies"),
     background: bool = Query(True, description="Run in background")
 ):
     raw_user_id = user_id if user_id is not None else (id if id is not None else userId)
@@ -280,6 +297,8 @@ def trigger_scraper_get(
         pages=pages,
         limit=limit,
         dry_run=dry_run,
+        proxy=proxy,
+        proxy_file=proxy_file,
         background=background
     )
 
@@ -291,6 +310,8 @@ def _start_scraper_job(
     pages: Optional[int] = None,
     limit: Optional[int] = None,
     dry_run: bool = False,
+    proxy: Optional[Union[str, List[str]]] = None,
+    proxy_file: Optional[str] = None,
     background: bool = True
 ):
     with _state_lock:
@@ -314,7 +335,9 @@ def _start_scraper_job(
                 "users": users,
                 "pages": pages,
                 "limit": limit,
-                "dry_run": dry_run
+                "dry_run": dry_run,
+                "proxy": proxy,
+                "proxy_file": proxy_file
             },
             "progress": {
                 "current": 0,
@@ -328,7 +351,7 @@ def _start_scraper_job(
     if background:
         worker_thread = threading.Thread(
             target=_execute_scraper_job,
-            args=(job_id, user_id, user_name, users, pages, limit, dry_run),
+            args=(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file),
             daemon=True
         )
         worker_thread.start()
@@ -346,13 +369,15 @@ def _start_scraper_job(
                     "users": users,
                     "pages": pages,
                     "limit": limit,
-                    "dry_run": dry_run
+                    "dry_run": dry_run,
+                    "proxy": proxy,
+                    "proxy_file": proxy_file
                 }
             }
         )
     else:
         # Synchronous execution
-        _execute_scraper_job(job_id, user_id, user_name, users, pages, limit, dry_run)
+        _execute_scraper_job(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file)
         return _job_state["last_job"]
 
 

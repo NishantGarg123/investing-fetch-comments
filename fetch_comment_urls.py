@@ -536,19 +536,185 @@ class DatabaseManager:
             self.conn = None
 
 # ==========================================
+# PROXY CONFIGURATION & UTILITIES
+# ==========================================
+
+def parse_proxy(raw_proxy: str) -> Optional[str]:
+    """
+    Parses a proxy string into standard URL format (http://[user:pass@]host:port).
+    
+    Supported input formats:
+    - username:password.ip:port (e.g., user:pass.218.218.252:5432)
+    - username:password@ip:port (e.g., user:pass@218.218.252:5432)
+    - username:password:ip:port (e.g., user:pass:218.218.252:5432)
+    - ip:port:username:password (e.g., 218.218.252:5432:user:pass)
+    - ip:port (e.g., 218.218.252:5432)
+    - http://..., https://..., socks5://...
+    """
+    if not raw_proxy:
+        return None
+    raw = str(raw_proxy).strip()
+    if not raw or raw.startswith('#'):
+        return None
+
+    scheme = "http"
+    if "://" in raw:
+        scheme, raw = raw.split("://", 1)
+
+    # 1. Format: user:pass@host:port
+    if "@" in raw:
+        auth, host_port = raw.rsplit("@", 1)
+        return f"{scheme}://{auth}@{host_port}"
+
+    # 2. Format: username:password.ip:port (e.g. username:password.218.218.252:5432 or user:pass.host.com:8080)
+    dot_match = re.match(r"^(.+?)\.([a-zA-Z0-9\-_.]+\.[a-zA-Z0-9]+|\d{1,3}(?:\.\d{1,3})+):(\d+)$", raw)
+    if dot_match:
+        auth_part, host, port = dot_match.groups()
+        if ":" in auth_part:
+            return f"{scheme}://{auth_part}@{host}:{port}"
+
+    # 3. Format: 4 colon-separated parts (user:pass:host:port OR host:port:user:pass)
+    parts = raw.split(":")
+    if len(parts) == 4:
+        if parts[1].isdigit() and not parts[3].isdigit():
+            # host:port:user:pass
+            host, port, user, password = parts
+            return f"{scheme}://{user}:{password}@{host}:{port}"
+        elif parts[3].isdigit():
+            # user:pass:host:port
+            user, password, host, port = parts
+            return f"{scheme}://{user}:{password}@{host}:{port}"
+
+    # 4. Format: 2 parts host:port
+    if len(parts) == 2 and parts[1].isdigit():
+        host, port = parts
+        return f"{scheme}://{host}:{port}"
+
+    # Fallback if raw contains colon
+    if ":" in raw:
+        return f"{scheme}://{raw}"
+
+    return None
+
+
+def mask_proxy_url(proxy_url: Optional[str]) -> str:
+    """Masks proxy credentials for safe logging and output."""
+    if not proxy_url:
+        return "None"
+    return re.sub(r":([^:@/]+)@", r":***@", str(proxy_url))
+
+
+def load_proxy_list(
+    proxy: Optional[Union[str, List[str]]] = None,
+    proxy_file: Optional[str] = None
+) -> List[str]:
+    """
+    Loads and normalizes proxies from:
+    1. Direct arguments (string, comma-separated, or list)
+    2. Explicit proxy file or default proxies.txt / proxy.txt
+    3. Environment variables (PROXIES, PROXY_LIST, PROXY_FILE, PROXIES_FILE)
+    """
+    proxies: List[str] = []
+
+    # 1. From direct input argument
+    if proxy:
+        if isinstance(proxy, list):
+            for p in proxy:
+                parsed = parse_proxy(p)
+                if parsed:
+                    proxies.append(parsed)
+        elif isinstance(proxy, str):
+            for item in re.split(r'[\r\n,;]+', proxy):
+                parsed = parse_proxy(item)
+                if parsed:
+                    proxies.append(parsed)
+
+    # 2. From specified or candidate proxy files
+    file_candidates = []
+    if proxy_file:
+        file_candidates.append(proxy_file)
+    env_file = os.getenv("PROXY_FILE") or os.getenv("PROXIES_FILE")
+    if env_file:
+        file_candidates.append(env_file)
+    file_candidates.extend(["proxies.txt", "proxy.txt"])
+
+    for fpath in file_candidates:
+        if fpath and os.path.isfile(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            parsed = parse_proxy(line)
+                            if parsed:
+                                proxies.append(parsed)
+                if proxies:
+                    break
+            except Exception as e:
+                logger.warning(f"Error reading proxy file '{fpath}': {e}")
+
+    # 3. From environment variable PROXIES or PROXY_LIST
+    if not proxies:
+        env_proxies = os.getenv("PROXIES") or os.getenv("PROXY_LIST")
+        if env_proxies:
+            for item in re.split(r'[\r\n,;]+', env_proxies):
+                parsed = parse_proxy(item)
+                if parsed:
+                    proxies.append(parsed)
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_proxies = []
+    for p in proxies:
+        if p not in seen:
+            seen.add(p)
+            unique_proxies.append(p)
+
+    return unique_proxies
+
+
+def get_random_proxy(
+    proxy: Optional[Union[str, List[str]]] = None,
+    proxy_file: Optional[str] = None,
+    proxy_list: Optional[List[str]] = None
+) -> Optional[str]:
+    """Selects a random proxy from the available list."""
+    candidates = proxy_list if proxy_list is not None else load_proxy_list(proxy=proxy, proxy_file=proxy_file)
+    if candidates:
+        return random.choice(candidates)
+    return None
+
+
+# ==========================================
 # SCRAPER LOGIC
 # ==========================================
 
-def create_scraper_session():
-    """Creates an HTTP session with Chrome TLS fingerprinting if curl_cffi is available."""
+def create_scraper_session(proxy: Optional[str] = None):
+    """Creates an HTTP session with Chrome TLS fingerprinting and optional proxy configuration."""
+    proxies_dict = None
+    if proxy:
+        normalized_proxy = parse_proxy(proxy) or proxy
+        proxies_dict = {
+            "http": normalized_proxy,
+            "https": normalized_proxy
+        }
+        logger.info(f"Configuring session with proxy: {mask_proxy_url(normalized_proxy)}")
+    else:
+        logger.info("Configuring session without proxy (direct connection).")
+
     if HAS_CURL_CFFI:
         logger.info("Using curl_cffi with Chrome impersonation (bypasses Cloudflare 403).")
-        session = curl_requests.Session(impersonate="chrome120")
+        if proxies_dict:
+            session = curl_requests.Session(impersonate="chrome120", proxies=proxies_dict)
+        else:
+            session = curl_requests.Session(impersonate="chrome120")
         session.headers.update(DEFAULT_HEADERS)
         return session
     else:
         logger.warning("curl_cffi is NOT installed. Falling back to standard requests (may get 403). Run: pip install curl_cffi")
         session = requests.Session()
+        if proxies_dict:
+            session.proxies.update(proxies_dict)
         session.headers.update(DEFAULT_HEADERS)
         retry_strategy = Retry(
             total=3,
@@ -686,6 +852,8 @@ def run_scraper(
     pages: Optional[int] = None,
     limit: Optional[int] = None,
     dry_run: bool = False,
+    proxy: Optional[Union[str, List[str]]] = None,
+    proxy_file: Optional[str] = None,
     progress_callback: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
@@ -698,7 +866,17 @@ def run_scraper(
         - Fetches user list from InvestingDB.dbo.users table and runs for all users in the DB.
     """
     max_pages = pages if (pages is not None and pages > 0) else MAX_PAGES_PER_USER
-    session = create_scraper_session()
+
+    # Load and randomly select a proxy if proxies are configured
+    available_proxies = load_proxy_list(proxy=proxy, proxy_file=proxy_file)
+    selected_proxy = None
+    if available_proxies:
+        selected_proxy = random.choice(available_proxies)
+        logger.info(f"Loaded {len(available_proxies)} proxy/proxies. Randomly selected proxy for this run: {mask_proxy_url(selected_proxy)}")
+    else:
+        logger.info("No proxy configured or provided. Running with direct connection.")
+
+    session = create_scraper_session(proxy=selected_proxy)
     db = DatabaseManager()
 
     start_time = time.time()
@@ -706,6 +884,8 @@ def run_scraper(
         "status": "running",
         "dry_run": dry_run,
         "max_pages": max_pages,
+        "proxy": mask_proxy_url(selected_proxy) if selected_proxy else None,
+        "total_proxies_available": len(available_proxies),
         "users_total": 0,
         "users_processed": 0,
         "comments_found": 0,
@@ -868,6 +1048,8 @@ def main():
     parser.add_argument("--pages", type=int, default=MAX_PAGES_PER_USER, help=f"Max pages to scrape per user (default: {MAX_PAGES_PER_USER}).")
     parser.add_argument("--limit", type=int, help="Limit number of users to fetch from database.")
     parser.add_argument("--dry-run", action="store_true", help="Scrape and display comment URLs without writing to database.")
+    parser.add_argument("--proxy", type=str, help="Proxy or comma-separated proxies (e.g., username:password.218.218.252:5432).")
+    parser.add_argument("--proxy-file", type=str, help="Path to text file containing proxy list (one proxy per line).")
     args = parser.parse_args()
 
     run_scraper(
@@ -875,7 +1057,9 @@ def main():
         user_name=args.user_name,
         pages=args.pages,
         limit=args.limit,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        proxy=args.proxy,
+        proxy_file=args.proxy_file
     )
 
 

@@ -132,6 +132,57 @@ curl "http://localhost:3000/api/logs?lines=50"
 
 ---
 
+## 🛡️ Proxy Configuration & Random Rotation
+
+The scraper automatically selects a random proxy from your proxy list for each execution run to prevent IP rate-limiting and Cloudflare blocks.
+
+### 1. Supported Proxy Formats
+You can provide proxies in any of the following formats:
+- `username:password.ip:port` *(e.g., `user123:pass456.218.218.252:5432`)*
+- `username:password@ip:port` *(e.g., `user123:pass456@218.218.252:5432`)*
+- `username:password:ip:port` *(e.g., `user123:pass456:218.218.252:5432`)*
+- `ip:port:username:password` *(e.g., `218.218.252:5432:user123:pass456`)*
+- `ip:port` *(e.g., `218.218.252:5432`)*
+- `http://username:password@ip:port` / `socks5://...`
+
+### 2. Providing Proxies
+
+#### Method A: Proxy Text File (`proxies.txt`)
+Create a file named `proxies.txt` (or refer to `proxies.txt.example`) in the project root with one proxy per line:
+```text
+username1:password1.218.218.252:5432
+username2:password2.218.218.253:5432
+```
+
+#### Method B: Environment Variable (`.env`)
+In your `.env` file:
+```ini
+PROXIES=username:password.218.218.252:5432,username2:password2.218.218.253:5432
+# Or specify a custom file path:
+# PROXY_FILE=proxies.txt
+```
+
+#### Method C: REST API Trigger Payload
+Pass the `proxy` or `proxies` parameter in the `/api/run` request:
+```bash
+curl -X POST http://localhost:3000/api/run \
+     -H "Content-Type: application/json" \
+     -d '{
+       "user_id": 274394243,
+       "proxy": "username:password.218.218.252:5432",
+       "background": true
+     }'
+```
+
+#### Method D: CLI Execution
+```bash
+python fetch_comment_urls.py --proxy "username:password.218.218.252:5432"
+# Or with a proxy file:
+python fetch_comment_urls.py --proxy-file proxies.txt
+```
+
+---
+
 ## 💻 Running Locally (Without Docker)
 
 1. **Install dependencies:**
