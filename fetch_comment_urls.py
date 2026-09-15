@@ -98,6 +98,43 @@ logger = logging.getLogger("InvestingScraper")
 # HTML PARSER LOGIC
 # ==========================================
 
+def normalize_comment_url_and_id(raw_href: str, base_url: str = BASE_URL) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Normalizes comment URLs and extracts the target comment ID.
+
+    Handles:
+    1. Direct comments:
+       '/commodities/silver-commentary?comment=47571123'
+       -> ID: 47571123, URL: 'https://www.investing.com/commodities/silver-commentary?comment=47571123'
+    2. Reply/Subcomments with fragment:
+       '/commodities/gold-commentary?comment=47571018#47571035'
+       -> ID: 47571035 (from after #), URL: 'https://www.investing.com/commodities/gold-commentary?comment=47571035'
+    """
+    if not raw_href or 'comment=' not in raw_href:
+        return None, None
+
+    # Check for reply anchor after '#' (e.g., #47571035)
+    hash_match = re.search(r'#(\d+)', raw_href)
+    param_match = re.search(r'comment=(\d+)', raw_href)
+
+    if hash_match:
+        comment_id = int(hash_match.group(1))
+    elif param_match:
+        comment_id = int(param_match.group(1))
+    else:
+        return None, None
+
+    # Strip query string and fragment to get the base path (e.g. /commodities/gold-commentary)
+    base_path = raw_href.split('?')[0].split('#')[0].strip()
+    if not base_path:
+        return None, None
+
+    clean_href = f"{base_path}?comment={comment_id}"
+    full_url = urljoin(base_url, clean_href)
+
+    return comment_id, full_url
+
+
 def extract_comments_from_html(
     html_content: str,
     base_url: str = BASE_URL,
@@ -127,32 +164,20 @@ def _extract_with_bs4(html_content: str, base_url: str, user_id: int, user_name:
             continue
 
         raw_href = link_tag.get('href', '').strip()
-        if not raw_href or 'comment=' not in raw_href:
+        comment_id, full_url = normalize_comment_url_and_id(raw_href, base_url)
+        if not comment_id or not full_url:
             continue
 
-        # Ignore subcomments / reply comments containing '#' (e.g. ?comment=123#456)
-        if '#' in raw_href:
-            continue
-
-        full_url = urljoin(base_url, raw_href)
-
-        # Extract comment ID
-        comment_id = None
-        match_param = re.search(r'comment=(\d+)', raw_href)
-        if match_param:
-            comment_id = int(match_param.group(1))
-
-        # Extract exact comment text
+        # Extract exact comment text corresponding to this comment/reply ID
         comment_text = ""
-        text_div = body.find('div', id=lambda x: x and x.startswith('commentText-'))
+        text_div = div.find('div', id=f'commentText-{comment_id}') or body.find('div', id=f'commentText-{comment_id}')
+        if not text_div:
+            text_div = body.find('div', id=lambda x: x and x.startswith('commentText-')) or div.find('div', id=lambda x: x and x.startswith('commentText-'))
+
         if text_div:
             comment_text = text_div.get_text(separator=' ', strip=True)
-            if not comment_id:
-                id_match = re.search(r'commentText-(\d+)', text_div.get('id', ''))
-                if id_match:
-                    comment_id = int(id_match.group(1))
 
-        if not comment_id or comment_id in seen_ids:
+        if comment_id in seen_ids:
             continue
 
         seen_ids.add(comment_id)
@@ -184,16 +209,16 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int, user_nam
         )
         for href, c_id, txt in link_text_pattern.findall(html_content):
             raw_href = href.strip()
-            if '#' in raw_href or 'comment=' not in raw_href:
+            comment_id, full_url = normalize_comment_url_and_id(raw_href, base_url)
+            if not comment_id or not full_url:
                 continue
 
-            comment_id = int(c_id)
             if comment_id in seen_ids:
                 continue
             seen_ids.add(comment_id)
             comments.append({
                 'id': comment_id,
-                'url': urljoin(base_url, raw_href),
+                'url': full_url,
                 'user_id': user_id,
                 'user_name': user_name,
                 'comment_text': re.sub(r'<[^>]+>', '', txt).strip()
@@ -206,26 +231,18 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int, user_nam
             continue
         raw_href = href_match.group(1).strip()
 
-        if '#' in raw_href or 'comment=' not in raw_href:
+        comment_id, full_url = normalize_comment_url_and_id(raw_href, base_url)
+        if not comment_id or not full_url:
             continue
-
-        full_url = urljoin(base_url, raw_href)
-
-        param_match = re.search(r'comment=(\d+)', raw_href)
-        if param_match:
-            comment_id = int(param_match.group(1))
-        else:
-            id_match = re.search(r'id=["\']commentText-(\d+)["\']', block)
-            if id_match:
-                comment_id = int(id_match.group(1))
-            else:
-                continue
 
         if comment_id in seen_ids:
             continue
 
-        # Extract text from commentText div
-        text_match = re.search(r'<div[^>]*id=["\']commentText-\d+["\'][^>]*>(.*?)</div>', block, re.DOTALL)
+        # Extract text from commentText div matching id or any commentText div in block
+        text_match = re.search(rf'<div[^>]*id=["\']commentText-{comment_id}["\'][^>]*>(.*?)</div>', block, re.DOTALL)
+        if not text_match:
+            text_match = re.search(r'<div[^>]*id=["\']commentText-\d+["\'][^>]*>(.*?)</div>', block, re.DOTALL)
+
         comment_text = re.sub(r'<[^>]+>', '', text_match.group(1)).strip() if text_match else ""
 
         seen_ids.add(comment_id)
