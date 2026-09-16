@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from fetch_comment_urls import run_scraper, MAX_PAGES_PER_USER
+from aws_billing import router as billing_router
 
 # =====================================================================
 # APPLICATION CONFIGURATION
@@ -31,6 +32,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(billing_router)
 
 APP_START_TIME = time.time()
 LOG_FILE_PATH = os.getenv("LOG_FILE", "comment_scraper.log")
