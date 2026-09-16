@@ -77,9 +77,45 @@ def fetch_fargate_billing(region="us-west-2", start_date=None, end_date=None):
             print(f"   -> Daily Total: ${period_cost:.4f}\n")
             total_cost += period_cost
 
-        print(f"💰 =======================================")
-        print(f"💰 Total ECS Fargate Cost ({region}): ${total_cost:.4f} USD")
-        print(f"💰 =======================================")
+        # Fetch and display summation for previous 3 months
+        # Calculate 3 months back start date
+        past_year = today.year
+        past_month = today.month - 3
+        while past_month <= 0:
+            past_month += 12
+            past_year -= 1
+        past_start = f"{past_year:04d}-{past_month:02d}-01"
+
+        print("=======================================")
+        print(f"💰 Current Month-to-Date Total ({region}): ${total_cost:.4f} USD")
+        print("=======================================\n")
+
+        print("📊 Querying Previous 3 Months Totals...")
+        history_response = client.get_cost_and_usage(
+            TimePeriod={"Start": past_start, "End": end_date},
+            Granularity="MONTHLY",
+            Filter=cost_filter,
+            Metrics=["UnblendedCost"]
+        )
+
+        curr_month_start = today.replace(day=1).strftime("%Y-%m-%d")
+        print("📅 =======================================")
+        print(f"📊 Previous 3 Months Cost Summary ({region}):")
+        for period in history_response.get("ResultsByTime", []):
+            p_start = period.get("TimePeriod", {}).get("Start")
+            p_end = period.get("TimePeriod", {}).get("End")
+            cost = float(period.get("Total", {}).get("UnblendedCost", {}).get("Amount", 0.0))
+            try:
+                start_dt = datetime.strptime(p_start, "%Y-%m-%d")
+                label = start_dt.strftime("%m/%Y")
+                name = start_dt.strftime("%B %Y")
+            except Exception:
+                label = p_start
+                name = p_start
+
+            if p_start != curr_month_start:
+                print(f"   • {label} ({name}): ${cost:.4f} USD")
+        print("📅 =======================================")
 
     except Exception as e:
         print(f"❌ Failed to fetch AWS Billing: {e}")
