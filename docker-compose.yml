@@ -9,7 +9,11 @@ services:
       - "3000:3000"
     env_file:
       - .env
+    environment:
+      # SQLite persistent database path inside the container.
+      # /app/data is mounted to the 'sqlite_data' named volume below.
+      DATABASE_URL: "sqlite:////app/data/app.db"
+      LOG_FILE: "/app/data/comment_scraper.log"
     volumes:
-      - ./comment_scraper.log:/app/comment_scraper.log
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # Bind mount host data directory so DBeaver on Windows sees all changes in real time
+      - ./data:/app/data

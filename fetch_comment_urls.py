@@ -5,6 +5,8 @@ import random
 import logging
 import argparse
 import re
+import sqlite3
+import threading
 from typing import List, Dict, Any, Optional, Tuple, Union
 from urllib.parse import urljoin
 
@@ -31,32 +33,41 @@ try:
 except ImportError:
     HAS_BS4 = False
 
-try:
-    import pyodbc
-    HAS_PYODBC = True
-except ImportError:
-    HAS_PYODBC = False
-
-try:
-    import pymssql
-    HAS_PYMSSQL = True
-except ImportError:
-    HAS_PYMSSQL = False
-
 # ==========================================
 # CONFIGURATION
 # ==========================================
 
-DB_CONFIG = {
-    'driver': os.getenv('DB_DRIVER', '{ODBC Driver 17 for SQL Server}'),
-    'server': os.getenv('DB_SERVER', 'localhost'),
-    'database': os.getenv('DB_NAME', 'InvestingDB'),
-    'username': os.getenv('DB_USER', ''),
-    'password': os.getenv('DB_PASSWORD', ''),
-    'trusted_connection': os.getenv('DB_TRUSTED_CONNECTION', 'yes'),
-    'encrypt': os.getenv('DB_ENCRYPT', 'no'),
-    'trust_server_certificate': os.getenv('DB_TRUST_CERT', 'yes'),
-}
+# SQLite database path - configurable via environment variable.
+# Default: /app/data/app.db (Docker persistent volume mount path).
+# Override with: DATABASE_URL=sqlite:///path/to/app.db
+# or:            DB_PATH=/custom/path/app.db
+def _resolve_db_path() -> str:
+    """Resolves the SQLite database file path from environment, with safe fallback."""
+    # Check DATABASE_URL first (sqlite:///path style)
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if db_url:
+        if db_url.startswith("sqlite:///"):
+            path = db_url[len("sqlite:///"):]
+            if path:
+                return path
+        elif db_url.startswith("sqlite://"):
+            path = db_url[len("sqlite://"):]
+            if path:
+                return path
+
+    # Check DB_PATH directly
+    db_path = os.getenv("DB_PATH", "").strip()
+    if db_path:
+        return db_path
+
+    # Default: /app/data/app.db inside container (volume-mounted), or local fallback
+    default = "/app/data/app.db"
+    # If /app/data doesn't exist and we're not in Docker, fall back to local directory
+    if not os.path.isdir("/app/data") and not os.path.isdir("/app"):
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "app.db")
+    return default
+
+DB_PATH = _resolve_db_path()
 
 BASE_URL = "https://www.investing.com"
 MAX_PAGES_PER_USER = int(os.getenv('MAX_PAGES_PER_USER', '1'))
@@ -80,19 +91,26 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1"
 }
 
-# ==========================================
-# LOGGING SETUP
-# ==========================================
+_log_handlers = [logging.StreamHandler(sys.stdout)]
+_log_file_path = os.getenv('LOG_FILE', 'comment_scraper.log')
+if os.path.isdir(_log_file_path):
+    _log_file_path = os.path.join(_log_file_path, 'comment_scraper.log')
+
+try:
+    _log_dir = os.path.dirname(os.path.abspath(_log_file_path))
+    if _log_dir and not os.path.exists(_log_dir):
+        os.makedirs(_log_dir, exist_ok=True)
+    _log_handlers.append(logging.FileHandler(_log_file_path, encoding='utf-8'))
+except Exception:
+    pass
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('comment_scraper.log', encoding='utf-8')
-    ]
+    handlers=_log_handlers
 )
 logger = logging.getLogger("InvestingScraper")
+
 
 # ==========================================
 # HTML PARSER LOGIC
@@ -257,294 +275,522 @@ def _extract_with_regex(html_content: str, base_url: str, user_id: int, user_nam
     return comments
 
 # ==========================================
-# DATABASE MANAGER
+# DATABASE MANAGER (SQLite)
 # ==========================================
 
 class DatabaseManager:
-    def __init__(self, config: Dict[str, Any] = DB_CONFIG):
-        self.config = config
-        self.conn = None
-        self._ensured_columns = False
-        self._user_name_col_cached = None
+    """
+    SQLite-backed database manager.
 
-    def _get_best_driver(self) -> str:
-        if not HAS_PYODBC:
-            return self.config.get('driver', '{ODBC Driver 17 for SQL Server}')
-        
-        configured_driver = self.config.get('driver', '').strip('{}')
-        available_drivers = pyodbc.drivers()
-        
-        if configured_driver in available_drivers:
-            return f"{{{configured_driver}}}"
-        
-        priority_drivers = [
-            "ODBC Driver 18 for SQL Server",
-            "ODBC Driver 17 for SQL Server",
-            "ODBC Driver 13 for SQL Server",
-            "ODBC Driver 11 for SQL Server",
-            "SQL Server Native Client 11.0",
-            "SQL Server Native Client 10.0",
-            "SQL Server"
-        ]
-        for drv in priority_drivers:
-            if drv in available_drivers:
-                return f"{{{drv}}}"
-        
-        return self.config.get('driver', '{ODBC Driver 17 for SQL Server}')
+    Replaces the previous SQL Server implementation (pyodbc / pymssql).
+    Preserves exactly the same public interface and behavior:
+      - get_connection()
+      - get_users(limit)
+      - get_unprocessed_users(limit)
+      - get_user_name(user_id)
+      - get_user_by_name(user_name)
+      - insert_comment_urls(comments)
+      - close()
 
-    def get_connection(self):
+    Tables created / managed:
+      users        – mirrors InvestingDB.dbo.users (id INTEGER PK, user_name TEXT)
+      comment_urls – mirrors InvestingDB.dbo.comment_urls
+                     (id INTEGER PK, url TEXT, user_id INTEGER, status TEXT,
+                      fetched_at TEXT, Comments TEXT, user_name TEXT)
+
+    The database file path is read from DB_PATH or DATABASE_URL env vars.
+    Default: /app/data/app.db (Docker persistent volume).
+    """
+
+    # Class-level lock: SQLite allows concurrent reads but serialises writes.
+    _write_lock = threading.Lock()
+
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self.conn: Optional[sqlite3.Connection] = None
+        self._schema_initialised = False
+        self._user_name_col_cached: Optional[str] = None
+        self._ensure_data_dir()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_data_dir(self):
+        """Creates the directory that will hold the .db file if it doesn't exist."""
+        data_dir = os.path.dirname(self.db_path)
+        if data_dir and not os.path.isdir(data_dir):
+            try:
+                os.makedirs(data_dir, exist_ok=True)
+                logger.info(f"Created SQLite data directory: {data_dir}")
+            except OSError as exc:
+                logger.warning(f"Could not create data directory '{data_dir}': {exc}")
+
+    def get_connection(self) -> sqlite3.Connection:
+        """
+        Returns a live SQLite connection, (re-)connecting if needed.
+        Enables WAL mode for better concurrent read performance.
+        """
         if self.conn:
             try:
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
+                self.conn.execute("SELECT 1")
                 return self.conn
             except Exception:
                 self.close()
 
-        if HAS_PYODBC:
-            conn_str = self._build_pyodbc_conn_str()
-            logger.info("Connecting to SQL Server via pyodbc...")
-            self.conn = pyodbc.connect(conn_str, autocommit=False)
-            self._ensure_schema_columns()
-            return self.conn
-        elif HAS_PYMSSQL:
-            logger.info("Connecting to SQL Server via pymssql...")
-            self.conn = pymssql.connect(
-                server=self.config.get('server', 'localhost'),
-                user=self.config.get('username', ''),
-                password=self.config.get('password', ''),
-                database=self.config.get('database', 'InvestingDB'),
-                autocommit=False
-            )
-            self._ensure_schema_columns()
-            return self.conn
-        else:
-            raise RuntimeError("Neither 'pyodbc' nor 'pymssql' is installed. Please run: pip install pyodbc")
-
-    def _ensure_schema_columns(self):
-        """Ensures the Comments and user_name columns exist in dbo.comment_urls table."""
-        if self._ensured_columns or not self.conn:
-            return
+        logger.info(f"Connecting to SQLite database: {self.db_path}")
+        # check_same_thread=False: connection is shared across threads;
+        # callers must serialise writes via _write_lock.
+        self.conn = sqlite3.connect(
+            self.db_path,
+            timeout=30.0,
+            check_same_thread=False,
+            isolation_level=None   # autocommit; we manage transactions explicitly
+        )
+        self.conn.execute("PRAGMA busy_timeout = 30000;")
+        self.conn.execute("PRAGMA synchronous = NORMAL;")
+        # DELETE / TRUNCATE mode avoids WAL shared-memory (.shm) locking issues on Windows/Docker mounted filesystems
         try:
-            cursor = self.conn.cursor()
-            # Ensure Comments column in comment_urls
-            cursor.execute("""
-            IF NOT EXISTS (
-                SELECT 1 FROM sys.columns 
-                WHERE object_id = OBJECT_ID('dbo.comment_urls') AND name = 'Comments'
-            )
-            BEGIN
-                ALTER TABLE dbo.comment_urls ADD Comments NVARCHAR(MAX);
-            END
-            """)
-            # Ensure user_name column in comment_urls
-            cursor.execute("""
-            IF NOT EXISTS (
-                SELECT 1 FROM sys.columns 
-                WHERE object_id = OBJECT_ID('dbo.comment_urls') AND name = 'user_name'
-            )
-            BEGIN
-                ALTER TABLE dbo.comment_urls ADD user_name NVARCHAR(MAX);
-            END
-            """)
-            self.conn.commit()
-            cursor.close()
-            self._ensured_columns = True
-        except Exception as e:
-            logger.debug(f"Note on column schema checks: {e}")
+            self.conn.execute("PRAGMA journal_mode = DELETE;")
+        except Exception:
+            pass
+        # Use Row factory so rows support index access like tuples
+        self.conn.row_factory = sqlite3.Row
+        self._initialise_schema()
+        return self.conn
+
+    def _initialise_schema(self):
+        """
+        Creates tables if they do not already exist and adds any missing columns.
+        Schema mirrors the SQL Server original:
+          dbo.users        -> users
+          dbo.comment_urls -> comment_urls
+        """
+        if self._schema_initialised:
+            return
+
+        conn = self.conn
+        with self._write_lock:
+            conn.execute("BEGIN")
+            try:
+                # --- users table ---
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id        INTEGER PRIMARY KEY,
+                        user_name TEXT
+                    )
+                """)
+
+                # --- comment_urls table ---
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS comment_urls (
+                        id         INTEGER PRIMARY KEY,
+                        url        TEXT    NOT NULL,
+                        user_id    INTEGER,
+                        status     TEXT    DEFAULT 'not processed',
+                        fetched_at TEXT,
+                        Comments   TEXT,
+                        user_name  TEXT
+                    )
+                """)
+
+                # Ensure Comments and user_name columns exist (migration safety for existing DBs)
+                existing_cols = {
+                    row[1].lower()
+                    for row in conn.execute("PRAGMA table_info(comment_urls)")
+                }
+                if 'comments' not in existing_cols:
+                    conn.execute("ALTER TABLE comment_urls ADD COLUMN Comments TEXT")
+                if 'user_name' not in existing_cols:
+                    conn.execute("ALTER TABLE comment_urls ADD COLUMN user_name TEXT")
+
+                # Index for fast UPSERT existence checks on (user_id, url)
+                conn.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_comment_urls_user_url
+                    ON comment_urls (user_id, url)
+                """)
+
+                # --- frontend_data table (for UI & external state storage) ---
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS frontend_data (
+                        id         TEXT PRIMARY KEY,
+                        user_id    INTEGER,
+                        user_name  TEXT,
+                        data       TEXT,
+                        status     TEXT DEFAULT 'active',
+                        created_at TEXT,
+                        updated_at TEXT
+                    )
+                """)
+
+                conn.execute("COMMIT")
+                self._schema_initialised = True
+                logger.info("SQLite schema initialised successfully.")
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.error(f"Failed to initialise SQLite schema: {exc}")
+                raise
+
+    # ------------------------------------------------------------------
+    # User-name column detection (mirrors original dynamic detection)
+    # ------------------------------------------------------------------
 
     def _get_user_name_column(self) -> Optional[str]:
-        """Dynamically identifies the column name for user name in dbo.users table."""
+        """
+        Dynamically identifies the column name used for user name in the users table.
+        Mirrors the original SQL Server INFORMATION_SCHEMA.COLUMNS logic via PRAGMA table_info.
+        """
         if self._user_name_col_cached is not None:
             return self._user_name_col_cached
 
         try:
             conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COLUMN_NAME 
-                FROM INFORMATION_SCHEMA.COLUMNS 
-                WHERE TABLE_NAME = 'users'
-            """)
-            cols = [row[0].lower() for row in cursor.fetchall()]
-            cursor.close()
-            for candidate in ['user_name', 'username', 'name', 'profile_name', 'profilename', 'display_name', 'user']:
+            # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+            cols = [row[1].lower() for row in conn.execute("PRAGMA table_info(users)")]
+            for candidate in ['user_name', 'username', 'name', 'profile_name',
+                              'profilename', 'display_name', 'user']:
                 if candidate in cols:
                     self._user_name_col_cached = candidate
                     return self._user_name_col_cached
-        except Exception as e:
-            logger.debug(f"Could not determine user name column in users table: {e}")
+        except Exception as exc:
+            logger.debug(f"Could not determine user name column in users table: {exc}")
 
         self._user_name_col_cached = None
         return None
 
+    # ------------------------------------------------------------------
+    # Public API – identical signatures to original DatabaseManager
+    # ------------------------------------------------------------------
+
     def get_user_name(self, user_id: int) -> str:
-        """Fetches the user name for a given user ID from InvestingDB.dbo.users table."""
+        """Fetches the user name for a given user ID from the users table."""
         name_col = self._get_user_name_column() or 'user_name'
         try:
             conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(f"SELECT {name_col} FROM InvestingDB.dbo.users WHERE id = ?", (user_id,))
-            row = cursor.fetchone()
-            cursor.close()
+            row = conn.execute(
+                f"SELECT {name_col} FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
             if row and row[0] is not None:
                 return str(row[0]).strip()
-        except Exception as e:
-            logger.debug(f"Could not fetch user name from users table for user_id={user_id}: {e}")
+        except Exception as exc:
+            logger.debug(f"Could not fetch user name for user_id={user_id}: {exc}")
         return ""
 
     def get_user_by_name(self, user_name: str) -> Optional[Dict[str, Any]]:
-        """Fetches user (id and name) for a given user name from InvestingDB.dbo.users table."""
+        """Fetches user (id and name) for a given user name from the users table."""
         if not user_name or not str(user_name).strip():
             return None
         cleaned_name = str(user_name).strip()
         name_col = self._get_user_name_column() or 'user_name'
         try:
             conn = self.get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                f"SELECT id, {name_col} FROM InvestingDB.dbo.users WHERE LOWER(LTRIM(RTRIM({name_col}))) = LOWER(?)",
+            # SQLite equivalent of: WHERE LOWER(LTRIM(RTRIM(col))) = LOWER(?)
+            row = conn.execute(
+                f"SELECT id, {name_col} FROM users WHERE LOWER(TRIM({name_col})) = LOWER(?)",
                 (cleaned_name,)
-            )
-            row = cursor.fetchone()
-            cursor.close()
+            ).fetchone()
             if row and row[0] is not None:
                 u_id = int(row[0])
                 u_name = str(row[1]).strip() if (len(row) > 1 and row[1] is not None) else cleaned_name
                 return {'id': u_id, 'user_name': u_name}
-        except Exception as e:
-            logger.debug(f"Could not fetch user by name '{cleaned_name}' from users table: {e}")
+        except Exception as exc:
+            logger.debug(f"Could not fetch user by name '{cleaned_name}': {exc}")
         return None
-
-    def _build_pyodbc_conn_str(self) -> str:
-        driver = self._get_best_driver()
-        server = self.config.get('server', 'localhost')
-        database = self.config.get('database', 'InvestingDB')
-        
-        parts = [
-            f"DRIVER={driver}",
-            f"SERVER={server}",
-            f"DATABASE={database}",
-        ]
-        
-        user = (self.config.get('username') or '').strip()
-        password = (self.config.get('password') or '').strip()
-        trusted = (self.config.get('trusted_connection') or '').strip().lower()
-
-        if user and password:
-            parts.append(f"UID={user}")
-            parts.append(f"PWD={password}")
-        elif trusted in ('yes', '1', 'true'):
-            parts.append("Trusted_Connection=yes")
-
-        if self.config.get('encrypt'):
-            parts.append(f"Encrypt={self.config['encrypt']}")
-        if self.config.get('trust_server_certificate'):
-            parts.append(f"TrustServerCertificate={self.config['trust_server_certificate']}")
-
-        return ";".join(parts) + ";"
 
     def get_users(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        Fetches users from InvestingDB.dbo.users table status-independently (without filtering by status).
+        Fetches users from the users table status-independently (without filtering by status).
         Returns a list of dicts: [{'id': <int>, 'user_name': <str>}, ...]
+        Mirrors original SQL Server behavior; uses LIMIT instead of TOP N.
         """
         conn = self.get_connection()
-        cursor = conn.cursor()
-        
         name_col = self._get_user_name_column()
         select_cols = f"id, {name_col}" if name_col else "id"
-        top_clause = f"TOP {int(limit)} " if limit else ""
-        query = f"SELECT {top_clause}{select_cols} FROM InvestingDB.dbo.users"
-            
-        cursor.execute(query)
-        rows = cursor.fetchall()
+        # SQLite uses LIMIT instead of TOP N
+        limit_clause = f" LIMIT {int(limit)}" if limit else ""
+        query = f"SELECT {select_cols} FROM users{limit_clause}"
+
+        rows = conn.execute(query).fetchall()
         users = []
         for row in rows:
             u_id = int(row[0])
             u_name = str(row[1]).strip() if (name_col and len(row) > 1 and row[1] is not None) else ""
             users.append({'id': u_id, 'user_name': u_name})
-        cursor.close()
         return users
 
     def get_unprocessed_users(self, limit: Optional[int] = None) -> List[int]:
         """Backward compatibility helper that returns list of user IDs."""
         return [u['id'] for u in self.get_users(limit=limit)]
 
+    def upsert_user(self, user_id: int, user_name: str) -> Dict[str, Any]:
+        """
+        Inserts or updates a user in the users table.
+        """
+        conn = self.get_connection()
+        name_col = self._get_user_name_column() or 'user_name'
+        cleaned_name = str(user_name or "").strip()
+        uid = int(user_id)
+
+        with self._write_lock:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    f"""
+                    INSERT INTO users (id, {name_col})
+                    VALUES (?, ?)
+                    ON CONFLICT(id) DO UPDATE SET {name_col} = excluded.{name_col}
+                    """,
+                    (uid, cleaned_name)
+                )
+                conn.execute("COMMIT")
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.error(f"Error upserting user id={uid}: {exc}")
+                raise
+
+        return {"id": uid, "user_name": cleaned_name}
+
+    def delete_user(self, user_id: int) -> bool:
+        """Deletes a user from the users table by ID."""
+        conn = self.get_connection()
+        uid = int(user_id)
+        with self._write_lock:
+            conn.execute("BEGIN")
+            try:
+                cursor = conn.execute("DELETE FROM users WHERE id = ?", (uid,))
+                conn.execute("COMMIT")
+                return cursor.rowcount > 0
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.error(f"Error deleting user id={uid}: {exc}")
+                raise
+
     def insert_comment_urls(self, comments: List[Dict[str, Any]]) -> int:
+        """
+        Inserts comment URLs into comment_urls table with UPSERT semantics.
+
+        Preserves original behavior:
+        - Skips rows where (user_id, url) already exists (no duplicate on unique pair).
+        - If a comment id already exists, skips (INSERT OR IGNORE).
+        - Returns count of newly inserted rows.
+
+        SQLite equivalent of the SQL Server IF NOT EXISTS / INSERT pattern.
+        """
         if not comments:
             return 0
 
         conn = self.get_connection()
-        cursor = conn.cursor()
         inserted_count = 0
 
-        # Check if 'id' is an IDENTITY column
-        is_identity = False
-        try:
-            cursor.execute("SELECT is_identity FROM sys.columns WHERE object_id = OBJECT_ID('dbo.comment_urls') AND name = 'id'")
-            row = cursor.fetchone()
-            if row and row[0] == 1:
-                is_identity = True
-        except Exception:
-            pass
-
-        insert_without_id_sql = """
-        IF NOT EXISTS (SELECT 1 FROM dbo.comment_urls WHERE (user_id = ? AND url = ?))
-        BEGIN
-            INSERT INTO dbo.comment_urls (url, user_id, status, fetched_at, Comments, user_name)
-            VALUES (?, ?, N'not processed', SYSDATETIME(), ?, ?);
-        END
-        """
-
-        insert_plain_sql = """
-        IF NOT EXISTS (SELECT 1 FROM dbo.comment_urls WHERE id = ? OR (user_id = ? AND url = ?))
-        BEGIN
-            INSERT INTO dbo.comment_urls (id, url, user_id, status, fetched_at, Comments, user_name)
-            VALUES (?, ?, ?, N'not processed', SYSDATETIME(), ?, ?);
-        END
-        """
-
-        for c in comments:
-            comment_text = c.get('comment_text', '')
-            user_name = c.get('user_name', '')
+        with self._write_lock:
+            conn.execute("BEGIN")
             try:
-                if is_identity:
-                    cursor.execute(insert_without_id_sql, (
-                        c['user_id'], c['url'],
-                        c['url'], c['user_id'], comment_text, user_name
-                    ))
-                else:
-                    cursor.execute(insert_plain_sql, (
-                        c['id'], c['user_id'], c['url'],
-                        c['id'], c['url'], c['user_id'], comment_text, user_name
-                    ))
+                for c in comments:
+                    comment_text = c.get('comment_text', '')
+                    user_name = c.get('user_name', '')
+                    comment_id = c.get('id')
+                    url = c.get('url', '')
+                    user_id = c.get('user_id')
+                    fetched_at = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
-                if cursor.rowcount > 0:
-                    inserted_count += 1
-            except Exception as e:
-                err_str = str(e)
-                if '544' in err_str:
-                    try:
-                        cursor.execute(insert_without_id_sql, (
-                            c['user_id'], c['url'],
-                            c['url'], c['user_id'], comment_text, user_name
-                        ))
-                        if cursor.rowcount > 0:
-                            inserted_count += 1
-                        is_identity = True
-                        continue
-                    except Exception as fallback_err:
-                        logger.warning(f"Error inserting comment URL {c.get('url')}: {fallback_err}")
-                else:
-                    logger.warning(f"Error inserting comment id={c.get('id')}: {e}")
+                    if comment_id is not None:
+                        # INSERT OR IGNORE respects: PK (id) and UNIQUE index (user_id, url)
+                        cursor = conn.execute(
+                            """
+                            INSERT OR IGNORE INTO comment_urls
+                                (id, url, user_id, status, fetched_at, Comments, user_name)
+                            VALUES (?, ?, ?, 'not processed', ?, ?, ?)
+                            """,
+                            (comment_id, url, user_id, fetched_at, comment_text, user_name)
+                        )
+                    else:
+                        # No id provided – let SQLite auto-assign ROWID
+                        cursor = conn.execute(
+                            """
+                            INSERT OR IGNORE INTO comment_urls
+                                (url, user_id, status, fetched_at, Comments, user_name)
+                            VALUES (?, ?, 'not processed', ?, ?, ?)
+                            """,
+                            (url, user_id, fetched_at, comment_text, user_name)
+                        )
 
-        conn.commit()
-        cursor.close()
+                    if cursor.rowcount > 0:
+                        inserted_count += 1
+
+                conn.execute("COMMIT")
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.warning(f"Error during batch insert of comment URLs: {exc}")
+                raise
+
         return inserted_count
 
+    def upsert_frontend_data(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inserts or updates a single record in frontend_data (SQLite).
+        Supports flexible JSON payloads, status tracking, and timestamps.
+        """
+        import json
+        import uuid
+        conn = self.get_connection()
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+        item_id = str(item.get("id") or item.get("_id") or uuid.uuid4().hex)
+        user_id = item.get("user_id") or item.get("userId")
+        user_name = item.get("user_name") or item.get("username")
+        status_val = str(item.get("status") or "active")
+
+        # Normalize data payload
+        payload_data = item.get("data") if "data" in item else item
+        if isinstance(payload_data, (dict, list)):
+            data_str = json.dumps(payload_data)
+        elif payload_data is not None:
+            data_str = str(payload_data)
+        else:
+            data_str = "{}"
+
+        with self._write_lock:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO frontend_data (id, user_id, user_name, data, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        user_id = coalesce(excluded.user_id, frontend_data.user_id),
+                        user_name = coalesce(excluded.user_name, frontend_data.user_name),
+                        data = excluded.data,
+                        status = excluded.status,
+                        updated_at = excluded.updated_at
+                    """,
+                    (item_id, user_id, user_name, data_str, status_val, now_str, now_str)
+                )
+                conn.execute("COMMIT")
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.error(f"Error upserting frontend_data: {exc}")
+                raise
+
+        return {
+            "id": item_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "data": payload_data,
+            "status": status_val,
+            "updated_at": now_str
+        }
+
+    def get_frontend_data(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        item_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Reads records from frontend_data table with pagination and filtering."""
+        import json
+        conn = self.get_connection()
+        query = "SELECT id, user_id, user_name, data, status, created_at, updated_at FROM frontend_data WHERE 1=1"
+        params: List[Any] = []
+
+        if item_id is not None and str(item_id).strip():
+            query += " AND id = ?"
+            params.append(str(item_id).strip())
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(int(user_id))
+        if status is not None and str(status).strip():
+            query += " AND status = ?"
+            params.append(str(status).strip())
+
+        query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        cursor = conn.execute(query, tuple(params))
+        results = []
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            if row_dict.get("data"):
+                try:
+                    row_dict["data"] = json.loads(row_dict["data"])
+                except Exception:
+                    pass
+            results.append(row_dict)
+        return results
+
+    def delete_frontend_data(self, item_id: str) -> bool:
+        """Deletes a record from frontend_data by ID."""
+        conn = self.get_connection()
+        with self._write_lock:
+            conn.execute("BEGIN")
+            try:
+                cursor = conn.execute("DELETE FROM frontend_data WHERE id = ?", (str(item_id),))
+                conn.execute("COMMIT")
+                return cursor.rowcount > 0
+            except Exception as exc:
+                conn.execute("ROLLBACK")
+                logger.error(f"Error deleting frontend_data id={item_id}: {exc}")
+                raise
+
+    def execute_query(
+        self,
+        query: str,
+        params: Optional[Union[List[Any], Dict[str, Any], Tuple[Any, ...]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Executes an arbitrary SQL query directly on the SQLite database.
+        Returns:
+            - For SELECT / PRAGMA / EXPLAIN queries: list of rows as dicts, columns, and row_count.
+            - For INSERT / UPDATE / DELETE / DDL queries: rows_affected, last_insert_rowid.
+        """
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty.")
+
+        cleaned_query = query.strip()
+        conn = self.get_connection()
+        query_type = cleaned_query.split()[0].upper() if cleaned_query.split() else ""
+        is_read = query_type in ("SELECT", "PRAGMA", "EXPLAIN", "WITH")
+
+        # Format params if passed
+        sql_params: Any = ()
+        if params is not None:
+            if isinstance(params, list):
+                sql_params = tuple(params)
+            else:
+                sql_params = params
+
+        if is_read:
+            cursor = conn.execute(cleaned_query, sql_params)
+            columns = [col[0] for col in cursor.description] if cursor.description else []
+            rows = [dict(row) for row in cursor.fetchall()]
+            return {
+                "type": "read",
+                "columns": columns,
+                "row_count": len(rows),
+                "data": rows
+            }
+        else:
+            with self._write_lock:
+                conn.execute("BEGIN")
+                try:
+                    cursor = conn.execute(cleaned_query, sql_params)
+                    rows_affected = cursor.rowcount
+                    last_id = cursor.lastrowid
+                    conn.execute("COMMIT")
+                    return {
+                        "type": "write",
+                        "rows_affected": rows_affected,
+                        "last_insert_rowid": last_id,
+                        "message": f"Query executed successfully ({rows_affected} rows affected)."
+                    }
+                except Exception as exc:
+                    conn.execute("ROLLBACK")
+                    logger.error(f"Error executing raw SQL query: {exc}")
+                    raise
+
     def close(self):
+        """Closes the database connection."""
         if self.conn:
             try:
                 self.conn.close()

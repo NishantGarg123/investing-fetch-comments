@@ -186,7 +186,7 @@ def get_ecs_fargate_billing(
     ),
     granularity: str = Query(
         "DAILY",
-        regex="^(DAILY|MONTHLY)$",
+        pattern="^(DAILY|MONTHLY)$",
         description="Cost aggregation interval: DAILY or MONTHLY"
     ),
     region: str = Query("us-west-2", description="AWS Region (default: us-west-2)"),
