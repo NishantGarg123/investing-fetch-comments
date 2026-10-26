@@ -67,6 +67,10 @@ class RunRequest(BaseModel):
     proxy: Optional[Union[str, List[str]]] = Field(None, description="Proxy or list of proxies (e.g. username:password.218.218.252:5432)")
     proxies: Optional[Union[List[str], str]] = Field(None, description="Alias for proxy")
     proxy_file: Optional[str] = Field(None, description="Path to file containing list of proxies")
+    cf_clearance: Optional[str] = Field(None, description="Cloudflare cf_clearance cookie value")
+    cfClearance: Optional[str] = Field(None, description="Alias for cf_clearance")
+    user_agent: Optional[str] = Field(None, description="User-Agent matching the cf_clearance cookie")
+    userAgent: Optional[str] = Field(None, description="Alias for user_agent")
     background: bool = Field(True, description="Run asynchronously in background (returns immediately)")
 
     model_config = {
@@ -78,6 +82,7 @@ class RunRequest(BaseModel):
                 "pages": 1,
                 "dry_run": False,
                 "proxy": "username:password.218.218.252:5432",
+                "cf_clearance": "example_cf_clearance_cookie_value",
                 "background": True
             }
         }
@@ -97,7 +102,9 @@ def _execute_scraper_job(
     limit: Optional[int],
     dry_run: bool,
     proxy: Optional[Union[str, List[str]]] = None,
-    proxy_file: Optional[str] = None
+    proxy_file: Optional[str] = None,
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None
 ):
     def progress_update(current_idx: int, total: int, u_id: int, u_name: str):
         with _state_lock:
@@ -120,6 +127,8 @@ def _execute_scraper_job(
             dry_run=dry_run,
             proxy=proxy,
             proxy_file=proxy_file,
+            cf_clearance=cf_clearance,
+            user_agent=user_agent,
             progress_callback=progress_update
         )
     except Exception as e:
@@ -242,6 +251,8 @@ def trigger_scraper_post(request: Optional[RunRequest] = Body(None)):
 
     raw_proxy = req_dict.get('proxy') if req_dict.get('proxy') is not None else req_dict.get('proxies')
     raw_proxy_file = req_dict.get('proxy_file') or req_dict.get('proxyFile') or req_dict.get('proxies_file')
+    raw_cf_clearance = req_dict.get('cf_clearance') or req_dict.get('cfClearance')
+    raw_user_agent = req_dict.get('user_agent') or req_dict.get('userAgent')
 
     return _start_scraper_job(
         user_id=user_id_val,
@@ -252,6 +263,8 @@ def trigger_scraper_post(request: Optional[RunRequest] = Body(None)):
         dry_run=request.dry_run,
         proxy=raw_proxy,
         proxy_file=raw_proxy_file,
+        cf_clearance=raw_cf_clearance,
+        user_agent=raw_user_agent,
         background=request.background
     )
 
@@ -270,6 +283,8 @@ def trigger_scraper_get(
     dry_run: bool = Query(False, description="Run in dry-run mode"),
     proxy: Optional[str] = Query(None, description="Proxy or comma-separated list of proxies (e.g. username:password.218.218.252:5432)"),
     proxy_file: Optional[str] = Query(None, description="Path to file containing list of proxies"),
+    cf_clearance: Optional[str] = Query(None, description="Cloudflare cf_clearance cookie value"),
+    user_agent: Optional[str] = Query(None, description="User-Agent matching the cf_clearance cookie"),
     background: bool = Query(True, description="Run in background")
 ):
     raw_user_id = user_id if user_id is not None else (id if id is not None else userId)
@@ -302,6 +317,8 @@ def trigger_scraper_get(
         dry_run=dry_run,
         proxy=proxy,
         proxy_file=proxy_file,
+        cf_clearance=cf_clearance,
+        user_agent=user_agent,
         background=background
     )
 
@@ -315,6 +332,8 @@ def _start_scraper_job(
     dry_run: bool = False,
     proxy: Optional[Union[str, List[str]]] = None,
     proxy_file: Optional[str] = None,
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None,
     background: bool = True
 ):
     with _state_lock:
@@ -340,7 +359,8 @@ def _start_scraper_job(
                 "limit": limit,
                 "dry_run": dry_run,
                 "proxy": proxy,
-                "proxy_file": proxy_file
+                "proxy_file": proxy_file,
+                "cf_clearance_provided": bool(cf_clearance)
             },
             "progress": {
                 "current": 0,
@@ -354,7 +374,7 @@ def _start_scraper_job(
     if background:
         worker_thread = threading.Thread(
             target=_execute_scraper_job,
-            args=(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file),
+            args=(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file, cf_clearance, user_agent),
             daemon=True
         )
         worker_thread.start()
@@ -374,13 +394,14 @@ def _start_scraper_job(
                     "limit": limit,
                     "dry_run": dry_run,
                     "proxy": proxy,
-                    "proxy_file": proxy_file
+                    "proxy_file": proxy_file,
+                    "cf_clearance_provided": bool(cf_clearance)
                 }
             }
         )
     else:
         # Synchronous execution
-        _execute_scraper_job(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file)
+        _execute_scraper_job(job_id, user_id, user_name, users, pages, limit, dry_run, proxy, proxy_file, cf_clearance, user_agent)
         return _job_state["last_job"]
 
 

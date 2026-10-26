@@ -61,8 +61,11 @@ DB_CONFIG = {
 BASE_URL = "https://www.investing.com"
 MAX_PAGES_PER_USER = int(os.getenv('MAX_PAGES_PER_USER', '1'))
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '20'))
-REQUEST_DELAY_MIN = float(os.getenv('REQUEST_DELAY_MIN', '1.5'))
-REQUEST_DELAY_MAX = float(os.getenv('REQUEST_DELAY_MAX', '3.0'))
+REQUEST_DELAY_MIN = float(os.getenv('REQUEST_DELAY_MIN', '3.0'))
+REQUEST_DELAY_MAX = float(os.getenv('REQUEST_DELAY_MAX', '6.0'))
+
+CF_CLEARANCE = os.getenv('CF_CLEARANCE') or os.getenv('CLOUDFLARE_CLEARANCE') or None
+CF_USER_AGENT = os.getenv('CF_USER_AGENT') or os.getenv('USER_AGENT') or None
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -706,8 +709,13 @@ def get_random_proxy(
 # SCRAPER LOGIC
 # ==========================================
 
-def create_scraper_session(proxy: Optional[str] = None):
-    """Creates an HTTP session with Chrome TLS fingerprinting and optional proxy configuration."""
+def create_scraper_session(
+    proxy: Optional[str] = None,
+    impersonate: str = "chrome120",
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None
+):
+    """Creates an HTTP session with Chrome TLS fingerprinting, optional proxy, and Cloudflare clearance cookies."""
     proxies_dict = None
     if proxy:
         normalized_proxy = parse_proxy(proxy) or proxy
@@ -719,20 +727,43 @@ def create_scraper_session(proxy: Optional[str] = None):
     else:
         logger.info("Configuring session without proxy (direct connection).")
 
+    active_cf_clearance = cf_clearance or CF_CLEARANCE
+    active_user_agent = user_agent or CF_USER_AGENT
+
+    headers = dict(DEFAULT_HEADERS)
+    if active_user_agent:
+        headers["User-Agent"] = active_user_agent
+
+    cookies = {}
+    if active_cf_clearance:
+        cookies["cf_clearance"] = active_cf_clearance.strip()
+        logger.info("Injected Cloudflare cf_clearance cookie into session.")
+
     if HAS_CURL_CFFI:
-        logger.info("Using curl_cffi with Chrome impersonation (bypasses Cloudflare 403).")
-        if proxies_dict:
-            session = curl_requests.Session(impersonate="chrome120", proxies=proxies_dict)
-        else:
-            session = curl_requests.Session(impersonate="chrome120")
-        session.headers.update(DEFAULT_HEADERS)
+        logger.info(f"Using curl_cffi with {impersonate} impersonation (bypasses Cloudflare 403).")
+        try:
+            if proxies_dict:
+                session = curl_requests.Session(impersonate=impersonate, proxies=proxies_dict)
+            else:
+                session = curl_requests.Session(impersonate=impersonate)
+        except Exception:
+            if proxies_dict:
+                session = curl_requests.Session(impersonate="chrome110", proxies=proxies_dict)
+            else:
+                session = curl_requests.Session(impersonate="chrome110")
+
+        session.headers.update(headers)
+        for k, v in cookies.items():
+            session.cookies.set(k, v, domain=".investing.com")
         return session
     else:
         logger.warning("curl_cffi is NOT installed. Falling back to standard requests (may get 403). Run: pip install curl_cffi")
         session = requests.Session()
         if proxies_dict:
             session.proxies.update(proxies_dict)
-        session.headers.update(DEFAULT_HEADERS)
+        session.headers.update(headers)
+        for k, v in cookies.items():
+            session.cookies.set(k, v, domain=".investing.com")
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
@@ -749,15 +780,22 @@ def fetch_user_comments(
     session,
     user_id: int,
     max_pages: int = MAX_PAGES_PER_USER,
-    user_name: str = ""
+    user_name: str = "",
+    available_proxies: Optional[List[str]] = None,
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None
 ) -> Tuple[List[Dict[str, Any]], bool]:
     """
-    Fetches comments for a user across pages.
+    Fetches comments for a user across pages with automatic retries,
+    proxy rotation, and browser impersonation cycling on 403/502/503/504/timeout errors.
     Returns: (list_of_comments, is_successful)
     """
     all_comments = []
     seen_comment_ids = set()
     success = True
+    current_session = session
+
+    fallback_impersonations = ["chrome120", "chrome124", "safari17_0", "edge101"]
 
     for page in range(1, max_pages + 1):
         if page == 1:
@@ -767,47 +805,97 @@ def fetch_user_comments(
 
         logger.info(f"Fetching User {user_id} - Page {page}/{max_pages}: {url}")
 
-        try:
-            response = session.get(url, timeout=REQUEST_TIMEOUT)
-            
-            if response.status_code == 404:
-                logger.warning(f"User {user_id} page {page} returned 404 Not Found.")
-                break
-            elif response.status_code == 403:
-                logger.error(f"User {user_id} page {page} returned HTTP 403 Forbidden (Cloudflare bot protection).")
-                success = False
-                break
-            elif response.status_code != 200:
-                logger.error(f"User {user_id} page {page} returned HTTP {response.status_code}")
-                success = False
-                break
+        max_attempts = 3
+        response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = current_session.get(url, timeout=REQUEST_TIMEOUT)
 
-            page_comments = extract_comments_from_html(
-                response.text,
-                base_url=BASE_URL,
-                user_id=user_id,
-                user_name=user_name
-            )
-
-            if not page_comments:
-                logger.info(f"No comments found on page {page} for user {user_id}.")
-                if page == 1:
+                if response.status_code == 404:
+                    logger.warning(f"User {user_id} page {page} returned 404 Not Found.")
+                    return all_comments, True
+                elif response.status_code == 403:
+                    logger.warning(f"User {user_id} page {page} returned HTTP 403 Forbidden (Cloudflare block, attempt {attempt}/{max_attempts}).")
+                    if attempt < max_attempts:
+                        alt_proxy = random.choice(available_proxies) if available_proxies else None
+                        alt_imp = fallback_impersonations[attempt % len(fallback_impersonations)]
+                        logger.info(f"Retrying with impersonation='{alt_imp}' and proxy={mask_proxy_url(alt_proxy)}...")
+                        current_session = create_scraper_session(
+                            proxy=alt_proxy,
+                            impersonate=alt_imp,
+                            cf_clearance=cf_clearance,
+                            user_agent=user_agent
+                        )
+                        time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                        continue
+                    else:
+                        logger.error(f"User {user_id} page {page} returned HTTP 403 Forbidden after {max_attempts} attempts.")
+                        success = False
+                        break
+                elif response.status_code in (429, 500, 502, 503, 504):
+                    logger.warning(f"User {user_id} page {page} returned HTTP {response.status_code} (attempt {attempt}/{max_attempts}).")
+                    if attempt < max_attempts:
+                        alt_proxy = random.choice(available_proxies) if available_proxies else None
+                        logger.info(f"Retrying on HTTP {response.status_code} with new proxy={mask_proxy_url(alt_proxy)}...")
+                        current_session = create_scraper_session(
+                            proxy=alt_proxy,
+                            cf_clearance=cf_clearance,
+                            user_agent=user_agent
+                        )
+                        time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                        continue
+                    else:
+                        logger.error(f"User {user_id} page {page} failed with HTTP {response.status_code} after {max_attempts} attempts.")
+                        success = False
+                        break
+                elif response.status_code != 200:
+                    logger.error(f"User {user_id} page {page} returned HTTP {response.status_code}")
+                    success = False
                     break
-            else:
-                new_page_count = 0
-                for c in page_comments:
-                    if c['id'] not in seen_comment_ids:
-                        seen_comment_ids.add(c['id'])
-                        all_comments.append(c)
-                        new_page_count += 1
-                logger.info(f"Extracted {new_page_count} comments from page {page} (Total unique so far: {len(all_comments)})")
+                else:
+                    # Success
+                    break
 
-            if "pagination" not in response.text and page > 1:
+            except Exception as e:
+                logger.error(f"Network error fetching user {user_id} page {page} (attempt {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    alt_proxy = random.choice(available_proxies) if available_proxies else None
+                    logger.info(f"Retrying after network error with proxy={mask_proxy_url(alt_proxy)}...")
+                    current_session = create_scraper_session(
+                        proxy=alt_proxy,
+                        cf_clearance=cf_clearance,
+                        user_agent=user_agent
+                    )
+                    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+                    continue
+                else:
+                    success = False
+                    break
+
+        if not success or response is None or response.status_code != 200:
+            break
+
+        page_comments = extract_comments_from_html(
+            response.text,
+            base_url=BASE_URL,
+            user_id=user_id,
+            user_name=user_name
+        )
+
+        if not page_comments:
+            logger.info(f"No comments found on page {page} for user {user_id}.")
+            if page == 1:
                 break
+        else:
+            new_page_count = 0
+            for c in page_comments:
+                if c['id'] not in seen_comment_ids:
+                    seen_comment_ids.add(c['id'])
+                    all_comments.append(c)
+                    new_page_count += 1
+            logger.info(f"Extracted {new_page_count} comments from page {page} (Total unique so far: {len(all_comments)})")
 
-        except Exception as e:
-            logger.error(f"Network error fetching user {user_id} page {page}: {e}")
-            success = False
+        if "pagination" not in response.text and page > 1:
             break
 
         if page < max_pages:
@@ -823,7 +911,10 @@ def process_user(
     user_id: int,
     max_pages: int,
     user_name: str = "",
-    dry_run: bool = False
+    dry_run: bool = False,
+    available_proxies: Optional[List[str]] = None,
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None
 ) -> Dict[str, Any]:
     # If user_name not supplied, fetch it directly from dbo.users table
     if not user_name:
@@ -833,7 +924,15 @@ def process_user(
     logger.info(f"--- Starting processing for User ID: {user_id}{name_display} ---")
     result = {"user_id": user_id, "user_name": user_name, "found": 0, "saved": 0, "success": False}
     try:
-        comments, success = fetch_user_comments(session, user_id, max_pages=max_pages, user_name=user_name)
+        comments, success = fetch_user_comments(
+            session=session,
+            user_id=user_id,
+            max_pages=max_pages,
+            user_name=user_name,
+            available_proxies=available_proxies,
+            cf_clearance=cf_clearance,
+            user_agent=user_agent
+        )
         result["found"] = len(comments)
         result["success"] = success
 
@@ -871,6 +970,8 @@ def run_scraper(
     dry_run: bool = False,
     proxy: Optional[Union[str, List[str]]] = None,
     proxy_file: Optional[str] = None,
+    cf_clearance: Optional[str] = None,
+    user_agent: Optional[str] = None,
     progress_callback: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
@@ -884,16 +985,19 @@ def run_scraper(
     """
     max_pages = pages if (pages is not None and pages > 0) else MAX_PAGES_PER_USER
 
-    # Load and randomly select a proxy if proxies are configured
+    # Load proxies and resolve Cloudflare clearance cookies
     available_proxies = load_proxy_list(proxy=proxy, proxy_file=proxy_file)
-    selected_proxy = None
+    active_cf_clearance = cf_clearance or CF_CLEARANCE
+    active_user_agent = user_agent or CF_USER_AGENT
+
     if available_proxies:
-        selected_proxy = random.choice(available_proxies)
-        logger.info(f"Loaded {len(available_proxies)} proxy/proxies. Randomly selected proxy for this run: {mask_proxy_url(selected_proxy)}")
+        logger.info(f"Loaded {len(available_proxies)} proxy/proxies. Proxies will be rotated per user and retry.")
     else:
         logger.info("No proxy configured or provided. Running with direct connection.")
 
-    session = create_scraper_session(proxy=selected_proxy)
+    if active_cf_clearance:
+        logger.info("Cloudflare cf_clearance cookie is configured and will be injected.")
+
     db = DatabaseManager()
 
     start_time = time.time()
@@ -901,8 +1005,8 @@ def run_scraper(
         "status": "running",
         "dry_run": dry_run,
         "max_pages": max_pages,
-        "proxy": mask_proxy_url(selected_proxy) if selected_proxy else None,
         "total_proxies_available": len(available_proxies),
+        "cf_clearance_enabled": bool(active_cf_clearance),
         "users_total": 0,
         "users_processed": 0,
         "comments_found": 0,
@@ -995,7 +1099,25 @@ def run_scraper(
                 if progress_callback:
                     progress_callback(i, len(target_users), u_id, u_name)
 
-                res = process_user(db, session, user_id=u_id, max_pages=max_pages, user_name=u_name, dry_run=dry_run)
+                # Rotate proxy per user
+                u_proxy = random.choice(available_proxies) if available_proxies else None
+                u_session = create_scraper_session(
+                    proxy=u_proxy,
+                    cf_clearance=active_cf_clearance,
+                    user_agent=active_user_agent
+                )
+
+                res = process_user(
+                    db=db,
+                    session=u_session,
+                    user_id=u_id,
+                    max_pages=max_pages,
+                    user_name=u_name,
+                    dry_run=dry_run,
+                    available_proxies=available_proxies,
+                    cf_clearance=active_cf_clearance,
+                    user_agent=active_user_agent
+                )
                 summary["users_processed"] += 1
                 summary["comments_found"] += res.get("found", 0)
                 summary["comments_saved"] += res.get("saved", 0)
@@ -1029,7 +1151,25 @@ def run_scraper(
                 if progress_callback:
                     progress_callback(i, len(users_from_db), u_id, u_name)
 
-                res = process_user(db, session, user_id=u_id, max_pages=max_pages, user_name=u_name, dry_run=dry_run)
+                # Rotate proxy per user
+                u_proxy = random.choice(available_proxies) if available_proxies else None
+                u_session = create_scraper_session(
+                    proxy=u_proxy,
+                    cf_clearance=active_cf_clearance,
+                    user_agent=active_user_agent
+                )
+
+                res = process_user(
+                    db=db,
+                    session=u_session,
+                    user_id=u_id,
+                    max_pages=max_pages,
+                    user_name=u_name,
+                    dry_run=dry_run,
+                    available_proxies=available_proxies,
+                    cf_clearance=active_cf_clearance,
+                    user_agent=active_user_agent
+                )
                 summary["users_processed"] += 1
                 summary["comments_found"] += res.get("found", 0)
                 summary["comments_saved"] += res.get("saved", 0)
