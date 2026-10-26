@@ -37,6 +37,8 @@ app.include_router(billing_router)
 
 APP_START_TIME = time.time()
 LOG_FILE_PATH = os.getenv("LOG_FILE", "comment_scraper.log")
+if os.path.isdir(LOG_FILE_PATH):
+    LOG_FILE_PATH = os.path.join(LOG_FILE_PATH, "scraper.log")
 
 # Concurrency & Job State Management
 _state_lock = threading.Lock()

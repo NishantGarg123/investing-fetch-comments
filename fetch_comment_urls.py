@@ -87,12 +87,16 @@ DEFAULT_HEADERS = {
 # LOGGING SETUP
 # ==========================================
 
+LOG_FILE_PATH = os.getenv("LOG_FILE", "comment_scraper.log")
+if os.path.isdir(LOG_FILE_PATH):
+    LOG_FILE_PATH = os.path.join(LOG_FILE_PATH, "scraper.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('comment_scraper.log', encoding='utf-8')
+        logging.FileHandler(LOG_FILE_PATH, encoding='utf-8')
     ]
 )
 logger = logging.getLogger("InvestingScraper")
